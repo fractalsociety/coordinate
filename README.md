@@ -75,6 +75,28 @@ squad init
 
 That's it. Each agent joins, reads its role instructions, and enters a work loop that checks for messages. The manager breaks down your goal and assigns tasks to workers.
 
+## Optional tmux Launcher
+
+For Unix-like environments that already use Claude Code, this repo also ships an optional helper script:
+
+```bash
+scripts/squad-tmux-launch.sh /path/to/project --dry-run
+```
+
+It can:
+- read project-local launcher config from `.squad/launcher.yaml`
+- read a task brief from `.squad/run-task.md`
+- generate manager / inspector prompt files under `.squad/quickstart/`
+- start a tiled `tmux` session and inject `/squad` commands into Claude panes
+- optionally create an isolated git worktree before launching agents
+
+Requirements:
+- `tmux`
+- `ruby` (used to parse `launcher.yaml`)
+- `claude`
+
+This launcher is intentionally separate from the core Rust CLI. Treat it as optional automation for people who want a repeatable multi-terminal workflow.
+
 ## Usage Flow
 
 ```

@@ -1,0 +1,33 @@
+project:
+  name: my-project
+  session_name: my-project-squad
+
+runtime:
+  claude_command: claude
+  claude_args:
+    - --dangerously-skip-permissions
+  manager_role: manager
+  worker_role: worker
+  inspector_role: inspector
+  workers: 2
+
+workspace:
+  init_args:
+    - --refresh-roles
+  worktree:
+    enabled: true
+    location: ~/.local/share/squad/worktrees/my-project
+    branch: feat/example-task
+    path: example-task
+    base_ref: HEAD
+
+focus:
+  files:
+    - src/index.ts
+    - src/app/main.ts
+  docs:
+    - README.md
+
+constraints:
+  - Keep existing public behavior stable
+  - Keep config backwards compatible

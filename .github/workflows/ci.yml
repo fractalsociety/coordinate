@@ -43,3 +43,9 @@ jobs:
 
       - name: cargo test
         run: cargo test --all
+
+      - name: launcher shell smoke tests
+        if: runner.os != 'Windows'
+        run: |
+          bash tests/squad_tmux_launcher_helpers_test.sh
+          bash tests/squad_tmux_launcher_smoke.sh

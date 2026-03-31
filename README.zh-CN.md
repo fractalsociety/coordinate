@@ -77,6 +77,28 @@ squad init
 
 就这么简单。每个 Agent 加入后会读取角色指令，然后进入持续检查消息的工作循环。Manager 会分析你的目标并分配任务给 Worker。
 
+## 可选的 tmux 启动器
+
+如果你在类 Unix 环境里使用 Claude Code，这个仓库还带了一个可选辅助脚本：
+
+```bash
+scripts/squad-tmux-launch.sh /path/to/project --dry-run
+```
+
+它可以：
+- 从 `.squad/launcher.yaml` 读取项目级启动配置
+- 从 `.squad/run-task.md` 读取本次任务说明
+- 在 `.squad/quickstart/` 下生成 manager / inspector prompt
+- 启动平铺布局的 `tmux` 会话，并自动向 Claude pane 注入 `/squad` 命令
+- 在启动 agent 前可选地创建独立 git worktree
+
+依赖：
+- `tmux`
+- `ruby`（用于解析 `launcher.yaml`）
+- `claude`
+
+这个启动器刻意保持在核心 Rust CLI 之外。它是给需要固定化多终端协作流程的用户准备的可选自动化能力。
+
 ## 使用流程
 
 ```
