@@ -1,0 +1,11 @@
+# Rust build output
+/target/
+
+# Squad runtime artifacts
+/.squad/
+
+# Temporary planning files
+findings.md
+progress.md
+task_plan.md
+.squad/
