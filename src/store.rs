@@ -1,8 +1,13 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::autopilot::{
+    RiskLevel, TaskGraphStatus, TaskGraphTask, TerminalKind, TerminalSessionPlan,
+    TerminalSessionStatus,
+};
 use crate::tasks::TaskRecord;
 
 const DEFAULT_MESSAGE_KIND: &str = "note";
@@ -39,6 +44,86 @@ pub struct MessageRecord {
 
 pub struct Store {
     conn: Connection,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutopilotRunRecord {
+    pub id: i64,
+    pub prd_path: String,
+    pub status: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutopilotAgentInput {
+    pub name: String,
+    pub role: String,
+    pub model_provider: String,
+    pub skills_prompt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutopilotAgentRecord {
+    pub id: i64,
+    pub run_id: i64,
+    pub name: String,
+    pub role: String,
+    pub model_provider: String,
+    pub skills_prompt: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutopilotTaskRecord {
+    pub id: i64,
+    pub run_id: i64,
+    pub title: String,
+    pub description: String,
+    pub assigned_role: Option<String>,
+    pub assigned_agent_id: Option<i64>,
+    pub status: String,
+    pub priority: i64,
+    pub risk_level: Option<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutopilotTaskDependencyRecord {
+    pub task_id: i64,
+    pub depends_on_task_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct AutopilotTaskStatusCounts {
+    pub ready_parallel: i64,
+    pub blocked: i64,
+    pub sequential: i64,
+    pub review_required: i64,
+    pub done: i64,
+    pub failed: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutopilotReviewRecord {
+    pub id: i64,
+    pub task_id: i64,
+    pub reviewer_agent_id: Option<i64>,
+    pub verdict: String,
+    pub notes: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutopilotTerminalSessionRecord {
+    pub id: i64,
+    pub run_id: i64,
+    pub agent_id: i64,
+    pub terminal_kind: String,
+    pub command: String,
+    pub status: String,
 }
 
 impl Store {
@@ -82,6 +167,128 @@ impl Store {
                  created_at INTEGER NOT NULL,
                  updated_at INTEGER NOT NULL,
                  completed_at INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS autopilot_runs (
+                 id INTEGER PRIMARY KEY,
+                 prd_path TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 completed_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS autopilot_agents (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 model_provider TEXT NOT NULL,
+                 skills_prompt TEXT NOT NULL,
+                 status TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS autopilot_tasks (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 title TEXT NOT NULL,
+                 description TEXT NOT NULL,
+                 assigned_role TEXT,
+                 assigned_agent_id INTEGER,
+                 status TEXT NOT NULL,
+                 priority INTEGER DEFAULT 0,
+                 risk_level TEXT,
+                 acceptance_criteria TEXT,
+                 created_at TEXT NOT NULL,
+                 completed_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS autopilot_task_dependencies (
+                 task_id INTEGER NOT NULL,
+                 depends_on_task_id INTEGER NOT NULL,
+                 PRIMARY KEY (task_id, depends_on_task_id)
+             );
+             CREATE TABLE IF NOT EXISTS autopilot_reviews (
+                 id INTEGER PRIMARY KEY,
+                 task_id INTEGER NOT NULL,
+                 reviewer_agent_id INTEGER,
+                 verdict TEXT NOT NULL,
+                 notes TEXT,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS autopilot_terminal_sessions (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 agent_id INTEGER NOT NULL,
+                 terminal_kind TEXT NOT NULL,
+                 command TEXT NOT NULL,
+                 status TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS science_swarm_runs (
+                 id INTEGER PRIMARY KEY,
+                 objective TEXT NOT NULL,
+                 prd_path TEXT,
+                 status TEXT NOT NULL,
+                 risk_class TEXT,
+                 created_at TEXT NOT NULL,
+                 completed_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS science_swarm_tasks (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 task_number TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 description TEXT NOT NULL,
+                 task_kind TEXT NOT NULL,
+                 execution_mode TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 assigned_agent_id INTEGER,
+                 assigned_provider TEXT,
+                 assigned_model TEXT,
+                 risk_level TEXT,
+                 acceptance_criteria TEXT,
+                 verification_required INTEGER DEFAULT 1,
+                 created_at TEXT NOT NULL,
+                 completed_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS science_swarm_task_dependencies (
+                 task_id INTEGER NOT NULL,
+                 depends_on_task_id INTEGER NOT NULL,
+                 PRIMARY KEY (task_id, depends_on_task_id)
+             );
+             CREATE TABLE IF NOT EXISTS science_swarm_agents (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 skills_prompt TEXT NOT NULL,
+                 status TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS science_swarm_traces (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 task_id INTEGER,
+                 agent_id INTEGER,
+                 provider TEXT,
+                 model TEXT,
+                 prompt TEXT NOT NULL,
+                 response TEXT,
+                 tool_calls TEXT,
+                 files_changed TEXT,
+                 tests_run TEXT,
+                 score REAL,
+                 accepted INTEGER DEFAULT 0,
+                 failure_reason TEXT,
+                 cost_usd REAL,
+                 latency_ms INTEGER,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS science_swarm_verifications (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 task_id INTEGER,
+                 layer TEXT NOT NULL,
+                 verdict TEXT NOT NULL,
+                 evidence TEXT,
+                 blocking INTEGER DEFAULT 0,
+                 created_at TEXT NOT NULL
              );",
         )?;
         // Migrations: add columns if missing (existing DBs)
@@ -105,6 +312,775 @@ impl Store {
             [DEFAULT_MESSAGE_KIND],
         );
         Ok(Self { conn })
+    }
+
+    pub fn create_autopilot_run(&self, prd_path: &str) -> Result<AutopilotRunRecord> {
+        let prd_path = prd_path.trim();
+        if prd_path.is_empty() {
+            anyhow::bail!("autopilot PRD path cannot be empty");
+        }
+
+        let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.conn.execute(
+            "INSERT INTO autopilot_runs (prd_path, status, created_at, completed_at)
+             VALUES (?1, 'running', ?2, NULL)",
+            params![prd_path, created_at],
+        )?;
+
+        let id = self.conn.last_insert_rowid();
+        Ok(AutopilotRunRecord {
+            id,
+            prd_path: prd_path.to_string(),
+            status: "running".to_string(),
+            created_at,
+            completed_at: None,
+        })
+    }
+
+    pub fn get_autopilot_run(&self, id: i64) -> Result<Option<AutopilotRunRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, prd_path, status, created_at, completed_at
+                 FROM autopilot_runs
+                 WHERE id = ?1",
+                [id],
+                map_autopilot_run_row,
+            )
+            .optional()
+            .context("failed to fetch autopilot run")
+    }
+
+    pub fn create_autopilot_agents(
+        &self,
+        run_id: i64,
+        agents: &[AutopilotAgentInput],
+    ) -> Result<Vec<AutopilotAgentRecord>> {
+        if agents.is_empty() {
+            anyhow::bail!("autopilot agent list cannot be empty");
+        }
+        if self.get_autopilot_run(run_id)?.is_none() {
+            anyhow::bail!("autopilot run does not exist: {run_id}");
+        }
+
+        let mut normalized_agents = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let name = required_autopilot_agent_field("name", &agent.name)?;
+            let role = required_autopilot_agent_field("role", &agent.role)?;
+            let model_provider =
+                required_autopilot_agent_field("model_provider", &agent.model_provider)?;
+            let skills_prompt =
+                required_autopilot_agent_field("skills_prompt", &agent.skills_prompt)?;
+            normalized_agents.push(AutopilotAgentInput {
+                name,
+                role,
+                model_provider,
+                skills_prompt,
+            });
+        }
+
+        let mut records = Vec::with_capacity(normalized_agents.len());
+        for agent in normalized_agents {
+            self.conn.execute(
+                "INSERT INTO autopilot_agents (
+                    run_id, name, role, model_provider, skills_prompt, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'planned')",
+                params![
+                    run_id,
+                    agent.name,
+                    agent.role,
+                    agent.model_provider,
+                    agent.skills_prompt
+                ],
+            )?;
+            records.push(AutopilotAgentRecord {
+                id: self.conn.last_insert_rowid(),
+                run_id,
+                name: agent.name,
+                role: agent.role,
+                model_provider: agent.model_provider,
+                skills_prompt: agent.skills_prompt,
+                status: "planned".to_string(),
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn list_autopilot_agents(&self, run_id: i64) -> Result<Vec<AutopilotAgentRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, name, role, model_provider, skills_prompt, status
+             FROM autopilot_agents
+             WHERE run_id = ?1
+             ORDER BY id",
+        )?;
+        let records = stmt
+            .query_map([run_id], map_autopilot_agent_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn create_autopilot_tasks(
+        &self,
+        run_id: i64,
+        tasks: &[TaskGraphTask],
+    ) -> Result<Vec<AutopilotTaskRecord>> {
+        if tasks.is_empty() {
+            anyhow::bail!("autopilot task list cannot be empty");
+        }
+        if self.get_autopilot_run(run_id)?.is_none() {
+            anyhow::bail!("autopilot run does not exist: {run_id}");
+        }
+
+        let mut normalized_tasks = Vec::with_capacity(tasks.len());
+        let mut graph_task_ids = std::collections::BTreeSet::new();
+        for task in tasks {
+            let graph_task_id = required_autopilot_task_field("id", &task.id)?;
+            if !graph_task_ids.insert(graph_task_id.clone()) {
+                anyhow::bail!("duplicate autopilot task graph id: {graph_task_id}");
+            }
+            let title = required_autopilot_task_field("title", &task.title)?;
+            let description = required_autopilot_task_field("description", &task.description)?;
+            normalized_tasks.push((task, title, description));
+        }
+        for task in tasks {
+            for dependency in &task.depends_on {
+                let dependency = dependency.trim();
+                if dependency == task.id.trim() {
+                    anyhow::bail!("autopilot task '{}' cannot depend on itself", task.id);
+                }
+                if !graph_task_ids.contains(dependency) {
+                    anyhow::bail!(
+                        "autopilot task '{}' depends on missing task '{}'",
+                        task.id,
+                        dependency
+                    );
+                }
+            }
+        }
+
+        let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut records = Vec::with_capacity(normalized_tasks.len());
+        let mut graph_to_db_id = BTreeMap::new();
+        for (task, title, description) in normalized_tasks {
+            let acceptance_criteria = serde_json::to_string(&task.acceptance_criteria)
+                .context("failed to serialize autopilot task acceptance criteria")?;
+            let status = task_status_label(&task.status);
+            let risk_level = risk_level_label(&task.risk_level);
+            self.conn.execute(
+                "INSERT INTO autopilot_tasks (
+                    run_id, title, description, assigned_role, assigned_agent_id, status,
+                    priority, risk_level, acceptance_criteria, created_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, NULL)",
+                params![
+                    run_id,
+                    title,
+                    description,
+                    task.assigned_role.as_deref(),
+                    status,
+                    task.priority,
+                    risk_level,
+                    acceptance_criteria,
+                    created_at
+                ],
+            )?;
+            let db_id = self.conn.last_insert_rowid();
+            graph_to_db_id.insert(task.id.trim().to_string(), db_id);
+            records.push(AutopilotTaskRecord {
+                id: db_id,
+                run_id,
+                title,
+                description,
+                assigned_role: task.assigned_role.clone(),
+                assigned_agent_id: None,
+                status: status.to_string(),
+                priority: task.priority,
+                risk_level: Some(risk_level.to_string()),
+                acceptance_criteria: task.acceptance_criteria.clone(),
+                created_at: created_at.clone(),
+                completed_at: None,
+            });
+        }
+        for task in tasks {
+            let task_id = graph_to_db_id
+                .get(task.id.trim())
+                .copied()
+                .with_context(|| format!("missing persisted task id for '{}'", task.id))?;
+            for dependency in &task.depends_on {
+                let depends_on_task_id = graph_to_db_id
+                    .get(dependency.trim())
+                    .copied()
+                    .with_context(|| {
+                        format!("missing persisted dependency id for '{}'", dependency)
+                    })?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO autopilot_task_dependencies (
+                        task_id, depends_on_task_id
+                     ) VALUES (?1, ?2)",
+                    params![task_id, depends_on_task_id],
+                )?;
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn list_autopilot_tasks(&self, run_id: i64) -> Result<Vec<AutopilotTaskRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, title, description, assigned_role, assigned_agent_id, status,
+                    priority, risk_level, acceptance_criteria, created_at, completed_at
+             FROM autopilot_tasks
+             WHERE run_id = ?1
+             ORDER BY id",
+        )?;
+        let records = stmt
+            .query_map([run_id], map_autopilot_task_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn ready_autopilot_tasks(&self, run_id: i64) -> Result<Vec<AutopilotTaskRecord>> {
+        if self.get_autopilot_run(run_id)?.is_none() {
+            anyhow::bail!("autopilot run does not exist: {run_id}");
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, title, description, assigned_role, assigned_agent_id, status,
+                    priority, risk_level, acceptance_criteria, created_at, completed_at
+             FROM autopilot_tasks t
+             WHERE t.run_id = ?1
+               AND t.assigned_agent_id IS NULL
+               AND t.status IN ('READY_PARALLEL', 'SEQUENTIAL')
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM autopilot_task_dependencies d
+                   JOIN autopilot_tasks dependency ON dependency.id = d.depends_on_task_id
+                   WHERE d.task_id = t.id
+                     AND dependency.status <> 'DONE'
+               )
+             ORDER BY t.priority DESC, t.id",
+        )?;
+        let records = stmt
+            .query_map([run_id], map_autopilot_task_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn assign_ready_autopilot_tasks(&self, run_id: i64) -> Result<Vec<AutopilotTaskRecord>> {
+        let ready_tasks = self.ready_autopilot_tasks(run_id)?;
+        if ready_tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let workers: Vec<AutopilotAgentRecord> = self
+            .list_autopilot_agents(run_id)?
+            .into_iter()
+            .filter(|agent| agent.role != "manager" && agent.role != "inspector")
+            .collect();
+        if workers.is_empty() {
+            anyhow::bail!("autopilot run {run_id} has no worker agents");
+        }
+
+        let workers_by_role: BTreeMap<String, AutopilotAgentRecord> = workers
+            .iter()
+            .cloned()
+            .map(|worker| (worker.role.clone(), worker))
+            .collect();
+        let mut assigned = Vec::with_capacity(ready_tasks.len());
+        let mut next_worker_index = 0usize;
+        for task in ready_tasks {
+            let worker = if let Some(role) = task.assigned_role.as_deref() {
+                let worker = workers_by_role.get(role).with_context(|| {
+                    format!(
+                        "ready autopilot task '{}' has no worker for role '{role}'",
+                        task.id
+                    )
+                })?;
+                if let Some(worker_index) = workers
+                    .iter()
+                    .position(|candidate| candidate.id == worker.id)
+                {
+                    next_worker_index = worker_index + 1;
+                }
+                worker
+            } else {
+                let worker = &workers[next_worker_index % workers.len()];
+                next_worker_index += 1;
+                worker
+            };
+            self.conn.execute(
+                "UPDATE autopilot_tasks
+                 SET assigned_agent_id = ?1,
+                     assigned_role = COALESCE(assigned_role, ?2)
+                WHERE id = ?3
+                   AND run_id = ?4
+                   AND assigned_agent_id IS NULL",
+                params![worker.id, worker.role.as_str(), task.id, run_id],
+            )?;
+            assigned
+                .push(self.get_autopilot_task(task.id)?.with_context(|| {
+                    format!("assigned autopilot task disappeared: {}", task.id)
+                })?);
+        }
+        Ok(assigned)
+    }
+
+    pub fn autopilot_task_launch_blockers(&self, task_id: i64) -> Result<Vec<String>> {
+        let task = self
+            .get_autopilot_task(task_id)?
+            .with_context(|| format!("autopilot task does not exist: {task_id}"))?;
+        let mut blockers = Vec::new();
+        if task.assigned_agent_id.is_some() {
+            blockers.push("task is already assigned".to_string());
+        }
+        if !matches!(task.status.as_str(), "READY_PARALLEL" | "SEQUENTIAL") {
+            blockers.push(format!("task status is {}", task.status));
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT dependency.id, dependency.title, dependency.status
+             FROM autopilot_task_dependencies d
+             JOIN autopilot_tasks dependency ON dependency.id = d.depends_on_task_id
+             WHERE d.task_id = ?1
+               AND dependency.status <> 'DONE'
+             ORDER BY dependency.id",
+        )?;
+        let dependency_blockers = stmt
+            .query_map([task_id], |row| {
+                let id: i64 = row.get(0)?;
+                let title: String = row.get(1)?;
+                let status: String = row.get(2)?;
+                Ok(format!("dependency {id} ({title}) is {status}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        blockers.extend(dependency_blockers);
+        Ok(blockers)
+    }
+
+    pub fn autopilot_task_status_counts(&self, run_id: i64) -> Result<AutopilotTaskStatusCounts> {
+        if self.get_autopilot_run(run_id)?.is_none() {
+            anyhow::bail!("autopilot run does not exist: {run_id}");
+        }
+        let mut counts = AutopilotTaskStatusCounts::default();
+        let mut stmt = self.conn.prepare(
+            "SELECT status, COUNT(*)
+             FROM autopilot_tasks
+             WHERE run_id = ?1
+             GROUP BY status",
+        )?;
+        let rows = stmt
+            .query_map([run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (status, count) in rows {
+            match status.as_str() {
+                "READY_PARALLEL" => counts.ready_parallel = count,
+                "BLOCKED" => counts.blocked = count,
+                "SEQUENTIAL" => counts.sequential = count,
+                "REVIEW_REQUIRED" => counts.review_required = count,
+                "DONE" => counts.done = count,
+                "FAILED" => counts.failed = count,
+                _ => {}
+            }
+        }
+        Ok(counts)
+    }
+
+    pub fn get_autopilot_task(&self, id: i64) -> Result<Option<AutopilotTaskRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, title, description, assigned_role, assigned_agent_id, status,
+                        priority, risk_level, acceptance_criteria, created_at, completed_at
+                 FROM autopilot_tasks
+                 WHERE id = ?1",
+                [id],
+                map_autopilot_task_row,
+            )
+            .optional()
+            .context("failed to fetch autopilot task")
+    }
+
+    pub fn submit_autopilot_task_for_review(&self, task_id: i64) -> Result<AutopilotTaskRecord> {
+        let task = self
+            .get_autopilot_task(task_id)?
+            .with_context(|| format!("autopilot task does not exist: {task_id}"))?;
+        if task.assigned_agent_id.is_none() {
+            anyhow::bail!("autopilot task {task_id} is not assigned to a worker");
+        }
+        if !matches!(task.status.as_str(), "READY_PARALLEL" | "SEQUENTIAL") {
+            anyhow::bail!(
+                "autopilot task {task_id} cannot be submitted for review from status {}",
+                task.status
+            );
+        }
+
+        let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let updated = self.conn.execute(
+            "UPDATE autopilot_tasks
+             SET status = 'REVIEW_REQUIRED',
+                 completed_at = ?1
+             WHERE id = ?2
+               AND status IN ('READY_PARALLEL', 'SEQUENTIAL')
+               AND assigned_agent_id IS NOT NULL",
+            params![completed_at, task_id],
+        )?;
+        ensure_autopilot_task_updated(updated, task_id)?;
+        self.get_autopilot_task(task_id)?
+            .with_context(|| format!("review autopilot task disappeared: {task_id}"))
+    }
+
+    pub fn create_autopilot_review(
+        &self,
+        task_id: i64,
+        reviewer_agent_id: Option<i64>,
+        verdict: &str,
+        notes: Option<&str>,
+    ) -> Result<AutopilotReviewRecord> {
+        let task = self
+            .get_autopilot_task(task_id)?
+            .with_context(|| format!("autopilot task does not exist: {task_id}"))?;
+        let verdict = normalized_review_verdict(verdict)?;
+        if let Some(reviewer_agent_id) = reviewer_agent_id {
+            let agent_run_id = self
+                .conn
+                .query_row(
+                    "SELECT run_id FROM autopilot_agents WHERE id = ?1",
+                    [reviewer_agent_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .with_context(|| {
+                    format!("autopilot reviewer agent does not exist: {reviewer_agent_id}")
+                })?;
+            if agent_run_id != task.run_id {
+                anyhow::bail!(
+                    "autopilot reviewer agent {reviewer_agent_id} does not belong to run {}",
+                    task.run_id
+                );
+            }
+        }
+
+        let notes = notes.and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        });
+        let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.conn.execute(
+            "INSERT INTO autopilot_reviews (
+                task_id, reviewer_agent_id, verdict, notes, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                task_id,
+                reviewer_agent_id,
+                verdict,
+                notes.as_deref(),
+                created_at
+            ],
+        )?;
+        Ok(AutopilotReviewRecord {
+            id: self.conn.last_insert_rowid(),
+            task_id,
+            reviewer_agent_id,
+            verdict: verdict.to_string(),
+            notes,
+            created_at,
+        })
+    }
+
+    pub fn list_autopilot_reviews(&self, task_id: i64) -> Result<Vec<AutopilotReviewRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, reviewer_agent_id, verdict, notes, created_at
+             FROM autopilot_reviews
+             WHERE task_id = ?1
+             ORDER BY id",
+        )?;
+        let records = stmt
+            .query_map([task_id], map_autopilot_review_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn accept_autopilot_task_result(
+        &self,
+        task_id: i64,
+        reviewer_agent_id: Option<i64>,
+        notes: Option<&str>,
+    ) -> Result<AutopilotTaskRecord> {
+        let task = self
+            .get_autopilot_task(task_id)?
+            .with_context(|| format!("autopilot task does not exist: {task_id}"))?;
+        if task.status != "REVIEW_REQUIRED" {
+            anyhow::bail!(
+                "autopilot task {task_id} cannot be accepted from status {}",
+                task.status
+            );
+        }
+        self.create_autopilot_review(task_id, reviewer_agent_id, "accepted", notes)?;
+
+        let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let updated = self.conn.execute(
+            "UPDATE autopilot_tasks
+             SET status = 'DONE',
+                 completed_at = ?1
+             WHERE id = ?2
+               AND status = 'REVIEW_REQUIRED'",
+            params![completed_at, task_id],
+        )?;
+        ensure_autopilot_task_updated(updated, task_id)?;
+        self.get_autopilot_task(task_id)?
+            .with_context(|| format!("accepted autopilot task disappeared: {task_id}"))
+    }
+
+    pub fn reject_autopilot_task_result(
+        &self,
+        task_id: i64,
+        reviewer_agent_id: Option<i64>,
+        notes: Option<&str>,
+    ) -> Result<AutopilotTaskRecord> {
+        let task = self
+            .get_autopilot_task(task_id)?
+            .with_context(|| format!("autopilot task does not exist: {task_id}"))?;
+        if task.status != "REVIEW_REQUIRED" {
+            anyhow::bail!(
+                "autopilot task {task_id} cannot be rejected from status {}",
+                task.status
+            );
+        }
+        self.create_autopilot_review(task_id, reviewer_agent_id, "rejected", notes)?;
+
+        let updated = self.conn.execute(
+            "UPDATE autopilot_tasks
+             SET status = 'FAILED'
+             WHERE id = ?1
+               AND status = 'REVIEW_REQUIRED'",
+            [task_id],
+        )?;
+        ensure_autopilot_task_updated(updated, task_id)?;
+        self.get_autopilot_task(task_id)?
+            .with_context(|| format!("rejected autopilot task disappeared: {task_id}"))
+    }
+
+    pub fn requeue_failed_autopilot_task(&self, task_id: i64) -> Result<AutopilotTaskRecord> {
+        let task = self
+            .get_autopilot_task(task_id)?
+            .with_context(|| format!("autopilot task does not exist: {task_id}"))?;
+        if task.status != "FAILED" {
+            anyhow::bail!(
+                "autopilot task {task_id} cannot be requeued from status {}",
+                task.status
+            );
+        }
+        let updated = self.conn.execute(
+            "UPDATE autopilot_tasks
+             SET status = 'READY_PARALLEL',
+                 assigned_agent_id = NULL,
+                 completed_at = NULL
+             WHERE id = ?1
+               AND status = 'FAILED'",
+            [task_id],
+        )?;
+        ensure_autopilot_task_updated(updated, task_id)?;
+        self.get_autopilot_task(task_id)?
+            .with_context(|| format!("requeued autopilot task disappeared: {task_id}"))
+    }
+
+    pub fn promote_failed_autopilot_task(&self, task_id: i64) -> Result<AutopilotTaskRecord> {
+        let task = self
+            .get_autopilot_task(task_id)?
+            .with_context(|| format!("autopilot task does not exist: {task_id}"))?;
+        if task.status != "FAILED" {
+            anyhow::bail!(
+                "autopilot task {task_id} cannot be promoted from status {}",
+                task.status
+            );
+        }
+        let current_rank = if let Some(agent_id) = task.assigned_agent_id {
+            self.autopilot_agent_model_rank(agent_id)?.unwrap_or(0)
+        } else {
+            0
+        };
+        let workers = self.list_autopilot_agents(task.run_id)?;
+        let promoted_worker = workers
+            .iter()
+            .filter(|agent| agent.role != "manager" && agent.role != "inspector")
+            .filter_map(|agent| {
+                let rank = model_provider_rank(&agent.model_provider);
+                if rank > current_rank {
+                    Some((rank, agent))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(rank, agent)| (*rank, -agent.id))
+            .map(|(_, agent)| agent)
+            .with_context(|| format!("autopilot task {task_id} has no stronger worker model"))?;
+
+        let updated = self.conn.execute(
+            "UPDATE autopilot_tasks
+             SET status = 'READY_PARALLEL',
+                 assigned_agent_id = ?1,
+                 assigned_role = ?2,
+                 completed_at = NULL
+             WHERE id = ?3
+               AND status = 'FAILED'",
+            params![promoted_worker.id, promoted_worker.role.as_str(), task_id],
+        )?;
+        ensure_autopilot_task_updated(updated, task_id)?;
+        self.get_autopilot_task(task_id)?
+            .with_context(|| format!("promoted autopilot task disappeared: {task_id}"))
+    }
+
+    pub fn autopilot_run_acceptance_satisfied(&self, run_id: i64) -> Result<bool> {
+        if self.get_autopilot_run(run_id)?.is_none() {
+            anyhow::bail!("autopilot run does not exist: {run_id}");
+        }
+        let unfinished: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM autopilot_tasks
+             WHERE run_id = ?1
+               AND status <> 'DONE'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(unfinished == 0)
+    }
+
+    pub fn complete_autopilot_run_if_accepted(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<AutopilotRunRecord>> {
+        if !self.autopilot_run_acceptance_satisfied(run_id)? {
+            return Ok(None);
+        }
+        Ok(Some(self.mark_autopilot_run_completed(run_id)?))
+    }
+
+    pub fn mark_autopilot_run_completed(&self, run_id: i64) -> Result<AutopilotRunRecord> {
+        if self.get_autopilot_run(run_id)?.is_none() {
+            anyhow::bail!("autopilot run does not exist: {run_id}");
+        }
+        let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.conn.execute(
+            "UPDATE autopilot_runs
+             SET status = 'completed',
+                 completed_at = ?1
+             WHERE id = ?2",
+            params![completed_at, run_id],
+        )?;
+        self.get_autopilot_run(run_id)?
+            .with_context(|| format!("completed autopilot run disappeared: {run_id}"))
+    }
+
+    fn autopilot_agent_model_rank(&self, agent_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT model_provider FROM autopilot_agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|provider| model_provider_rank(&provider)))
+    }
+
+    pub fn list_autopilot_task_dependencies(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<AutopilotTaskDependencyRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.task_id, d.depends_on_task_id
+             FROM autopilot_task_dependencies d
+             JOIN autopilot_tasks t ON t.id = d.task_id
+             WHERE t.run_id = ?1
+             ORDER BY d.task_id, d.depends_on_task_id",
+        )?;
+        let records = stmt
+            .query_map([run_id], map_autopilot_task_dependency_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn create_autopilot_terminal_sessions(
+        &self,
+        run_id: i64,
+        sessions: &[TerminalSessionPlan],
+    ) -> Result<Vec<AutopilotTerminalSessionRecord>> {
+        if sessions.is_empty() {
+            anyhow::bail!("autopilot terminal session list cannot be empty");
+        }
+        if self.get_autopilot_run(run_id)?.is_none() {
+            anyhow::bail!("autopilot run does not exist: {run_id}");
+        }
+
+        let agents = self.list_autopilot_agents(run_id)?;
+        let agent_ids_by_role: BTreeMap<String, i64> = agents
+            .into_iter()
+            .map(|agent| (agent.role, agent.id))
+            .collect();
+
+        let mut records = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let role_id = session.role_id.trim();
+            let Some(agent_id) = agent_ids_by_role.get(role_id).copied() else {
+                anyhow::bail!(
+                    "autopilot terminal session role '{}' has no persisted agent",
+                    session.role_id
+                );
+            };
+            let terminal_kind = terminal_kind_label(&session.terminal_kind);
+            let status = terminal_session_status_label(&session.status);
+            records.push(AutopilotTerminalSessionRecord {
+                id: 0,
+                run_id,
+                agent_id,
+                terminal_kind: terminal_kind.to_string(),
+                command: session.command.clone(),
+                status: status.to_string(),
+            });
+        }
+
+        let existing = self.list_autopilot_terminal_sessions(run_id)?;
+        if !existing.is_empty() {
+            if autopilot_terminal_sessions_match_plan(&existing, &records) {
+                return Ok(existing);
+            }
+            anyhow::bail!("autopilot run {run_id} already has a different terminal session plan");
+        }
+
+        for record in &mut records {
+            self.conn.execute(
+                "INSERT INTO autopilot_terminal_sessions (
+                    run_id, agent_id, terminal_kind, command, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    run_id,
+                    record.agent_id,
+                    record.terminal_kind,
+                    record.command,
+                    record.status
+                ],
+            )?;
+            record.id = self.conn.last_insert_rowid();
+        }
+        Ok(records)
+    }
+
+    pub fn list_autopilot_terminal_sessions(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<AutopilotTerminalSessionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, agent_id, terminal_kind, command, status
+             FROM autopilot_terminal_sessions
+             WHERE run_id = ?1
+             ORDER BY id",
+        )?;
+        let records = stmt
+            .query_map([run_id], map_autopilot_terminal_session_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
     }
 
     pub fn register_agent(&self, id: &str, role: &str) -> Result<String> {
@@ -803,6 +1779,176 @@ fn map_task_row(row: &rusqlite::Row) -> rusqlite::Result<TaskRecord> {
         updated_at: row.get(10)?,
         completed_at: row.get(11)?,
     })
+}
+
+fn map_autopilot_run_row(row: &rusqlite::Row) -> rusqlite::Result<AutopilotRunRecord> {
+    Ok(AutopilotRunRecord {
+        id: row.get(0)?,
+        prd_path: row.get(1)?,
+        status: row.get(2)?,
+        created_at: row.get(3)?,
+        completed_at: row.get(4)?,
+    })
+}
+
+fn map_autopilot_agent_row(row: &rusqlite::Row) -> rusqlite::Result<AutopilotAgentRecord> {
+    Ok(AutopilotAgentRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        name: row.get(2)?,
+        role: row.get(3)?,
+        model_provider: row.get(4)?,
+        skills_prompt: row.get(5)?,
+        status: row.get(6)?,
+    })
+}
+
+fn map_autopilot_task_row(row: &rusqlite::Row) -> rusqlite::Result<AutopilotTaskRecord> {
+    let acceptance_criteria_json: String = row.get(9)?;
+    let acceptance_criteria = serde_json::from_str(&acceptance_criteria_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(AutopilotTaskRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        title: row.get(2)?,
+        description: row.get(3)?,
+        assigned_role: row.get(4)?,
+        assigned_agent_id: row.get(5)?,
+        status: row.get(6)?,
+        priority: row.get(7)?,
+        risk_level: row.get(8)?,
+        acceptance_criteria,
+        created_at: row.get(10)?,
+        completed_at: row.get(11)?,
+    })
+}
+
+fn map_autopilot_task_dependency_row(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<AutopilotTaskDependencyRecord> {
+    Ok(AutopilotTaskDependencyRecord {
+        task_id: row.get(0)?,
+        depends_on_task_id: row.get(1)?,
+    })
+}
+
+fn map_autopilot_review_row(row: &rusqlite::Row) -> rusqlite::Result<AutopilotReviewRecord> {
+    Ok(AutopilotReviewRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        reviewer_agent_id: row.get(2)?,
+        verdict: row.get(3)?,
+        notes: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+fn map_autopilot_terminal_session_row(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<AutopilotTerminalSessionRecord> {
+    Ok(AutopilotTerminalSessionRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        terminal_kind: row.get(3)?,
+        command: row.get(4)?,
+        status: row.get(5)?,
+    })
+}
+
+fn autopilot_terminal_sessions_match_plan(
+    existing: &[AutopilotTerminalSessionRecord],
+    planned: &[AutopilotTerminalSessionRecord],
+) -> bool {
+    existing.len() == planned.len()
+        && existing.iter().zip(planned).all(|(existing, planned)| {
+            existing.run_id == planned.run_id
+                && existing.agent_id == planned.agent_id
+                && existing.terminal_kind == planned.terminal_kind
+                && existing.command == planned.command
+                && existing.status == planned.status
+        })
+}
+
+fn required_autopilot_agent_field(field: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("autopilot agent {field} cannot be empty");
+    }
+    Ok(value.to_string())
+}
+
+fn required_autopilot_task_field(field: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("autopilot task {field} cannot be empty");
+    }
+    Ok(value.to_string())
+}
+
+fn task_status_label(status: &TaskGraphStatus) -> &'static str {
+    match status {
+        TaskGraphStatus::ReadyParallel => "READY_PARALLEL",
+        TaskGraphStatus::Blocked => "BLOCKED",
+        TaskGraphStatus::Sequential => "SEQUENTIAL",
+        TaskGraphStatus::ReviewRequired => "REVIEW_REQUIRED",
+        TaskGraphStatus::Done => "DONE",
+        TaskGraphStatus::Failed => "FAILED",
+    }
+}
+
+fn risk_level_label(risk_level: &RiskLevel) -> &'static str {
+    match risk_level {
+        RiskLevel::Low => "low",
+        RiskLevel::Medium => "medium",
+        RiskLevel::High => "high",
+    }
+}
+
+fn terminal_kind_label(terminal_kind: &TerminalKind) -> &'static str {
+    match terminal_kind {
+        TerminalKind::Tmux => "tmux",
+    }
+}
+
+fn terminal_session_status_label(status: &TerminalSessionStatus) -> &'static str {
+    match status {
+        TerminalSessionStatus::Planned => "planned",
+        TerminalSessionStatus::Running => "running",
+        TerminalSessionStatus::Failed => "failed",
+        TerminalSessionStatus::Closed => "closed",
+    }
+}
+
+fn normalized_review_verdict(verdict: &str) -> Result<&'static str> {
+    match verdict.trim().to_ascii_lowercase().as_str() {
+        "accepted" | "accept" | "approved" | "approve" => Ok("accepted"),
+        "rejected" | "reject" | "failed" | "fail" => Ok("rejected"),
+        value if value.is_empty() => anyhow::bail!("autopilot review verdict cannot be empty"),
+        value => anyhow::bail!(
+            "invalid autopilot review verdict '{value}'. Expected accepted or rejected"
+        ),
+    }
+}
+
+fn model_provider_rank(provider: &str) -> i64 {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "local" => 1,
+        "openrouter_free" | "openrouter-free" => 2,
+        "openrouter_cheap" | "openrouter-cheap" | "gemini" | "opencode" => 3,
+        "codex" => 4,
+        "claude" => 5,
+        _ => 0,
+    }
+}
+
+fn ensure_autopilot_task_updated(updated: usize, task_id: i64) -> Result<()> {
+    if updated == 1 {
+        Ok(())
+    } else {
+        anyhow::bail!("stale autopilot task state for {task_id}")
+    }
 }
 
 fn ensure_task_updated(updated: usize, task_id: &str) -> Result<()> {

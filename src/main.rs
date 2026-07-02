@@ -2,9 +2,14 @@ use anyhow::{bail, Context, Result};
 use chrono::TimeZone;
 use fs2::FileExt;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 3_600;
+const DEFAULT_AUTOPILOT_ASSIGN_WAIT_SECS: u64 = 180;
+const DEFAULT_AUTOPILOT_TASKS_PER_ROLE: usize = 1;
 
 #[derive(Default)]
 struct JoinOptions {
@@ -83,6 +88,7 @@ fn main() -> Result<()> {
             cmd_receive(&id, wait, timeout_secs, json)
         }
         "task" => cmd_task(args.collect()),
+        "autopilot" | "swarm" => cmd_autopilot(args.collect()),
         "pending" => cmd_pending(),
         "history" => {
             let options = parse_history_args(args.collect())?;
@@ -605,6 +611,924 @@ fn cmd_init(args: Vec<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_autopilot(args: Vec<String>) -> Result<()> {
+    let subcommand = args.first().map(String::as_str).unwrap_or_default();
+    match subcommand {
+        "init" => {
+            if args.len() != 1 {
+                bail!("Usage: squad autopilot init");
+            }
+            cmd_autopilot_init()
+        }
+        "plan" => {
+            if args.len() != 2 {
+                bail!("Usage: squad autopilot plan <PRD.md>");
+            }
+            cmd_autopilot_plan(&args[1])
+        }
+        "launch" => {
+            let options = parse_autopilot_launch_args(&args[1..])?;
+            cmd_autopilot_launch(&options)
+        }
+        "run" => {
+            if args.len() != 2 {
+                bail!("Usage: squad autopilot run <PRD.md>");
+            }
+            cmd_autopilot_run(&args[1])
+        }
+        _ => bail!("Usage: squad autopilot <init|plan|launch|run> ..."),
+    }
+}
+
+fn cmd_autopilot_init() -> Result<()> {
+    let workspace = std::env::current_dir()?;
+    let result = squad::autopilot::init_autopilot_workspace(&workspace)?;
+    println!("Initialized squad autopilot workspace.");
+    if result.config_created {
+        println!("Created config: {}", result.config_path.display());
+    } else {
+        println!("Config already exists: {}", result.config_path.display());
+    }
+    println!("Autopilot artifacts: {}", result.autopilot_dir.display());
+    println!("Generated roles: {}", result.generated_roles_dir.display());
+    println!("Teams directory: {}", result.teams_dir.display());
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutopilotLaunchOptions {
+    run_id: i64,
+    execute: bool,
+    terminal_backend: AutopilotLaunchBackend,
+    tmux_session: Option<String>,
+    terminal_title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutopilotLaunchBackend {
+    Tmux,
+    MacosTerminal,
+}
+
+fn parse_autopilot_launch_args(args: &[String]) -> Result<AutopilotLaunchOptions> {
+    let mut run_id = None;
+    let mut execute = false;
+    let mut terminal_backend = default_autopilot_launch_backend();
+    let mut terminal_backend_provided = false;
+    let mut tmux_session = None;
+    let mut terminal_title = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--run-id" => {
+                let value = args.get(i + 1).context("--run-id requires a value")?;
+                let parsed: i64 = value
+                    .parse()
+                    .with_context(|| format!("invalid autopilot run id: {value}"))?;
+                if parsed <= 0 {
+                    bail!("autopilot run id must be positive");
+                }
+                run_id = Some(parsed);
+                i += 2;
+            }
+            "--execute" => {
+                execute = true;
+                i += 1;
+            }
+            "--terminal-backend" => {
+                let value = args
+                    .get(i + 1)
+                    .context("--terminal-backend requires a value")?;
+                terminal_backend = parse_autopilot_launch_backend(value)?;
+                terminal_backend_provided = true;
+                i += 2;
+            }
+            "--tmux-session" => {
+                let value = args.get(i + 1).context("--tmux-session requires a value")?;
+                if value.trim().is_empty() {
+                    bail!("tmux session name cannot be empty");
+                }
+                if !terminal_backend_provided {
+                    terminal_backend = AutopilotLaunchBackend::Tmux;
+                }
+                tmux_session = Some(value.trim().to_string());
+                i += 2;
+            }
+            "--terminal-title" => {
+                let value = args
+                    .get(i + 1)
+                    .context("--terminal-title requires a value")?;
+                if value.trim().is_empty() {
+                    bail!("terminal title cannot be empty");
+                }
+                if !terminal_backend_provided {
+                    terminal_backend = AutopilotLaunchBackend::MacosTerminal;
+                }
+                terminal_title = Some(value.trim().to_string());
+                i += 2;
+            }
+            _ => bail!("{}", autopilot_launch_usage()),
+        }
+    }
+    let run_id = run_id.context(autopilot_launch_usage())?;
+    Ok(AutopilotLaunchOptions {
+        run_id,
+        execute,
+        terminal_backend,
+        tmux_session,
+        terminal_title,
+    })
+}
+
+fn default_autopilot_launch_backend() -> AutopilotLaunchBackend {
+    if cfg!(target_os = "macos") {
+        AutopilotLaunchBackend::MacosTerminal
+    } else {
+        AutopilotLaunchBackend::Tmux
+    }
+}
+
+fn parse_autopilot_launch_backend(value: &str) -> Result<AutopilotLaunchBackend> {
+    match value.trim() {
+        "tmux" => Ok(AutopilotLaunchBackend::Tmux),
+        "macos-terminal" | "macos" | "terminal" | "terminal.app" => {
+            Ok(AutopilotLaunchBackend::MacosTerminal)
+        }
+        other => bail!("unsupported terminal backend: {other}; expected tmux or macos-terminal"),
+    }
+}
+
+fn autopilot_launch_usage() -> &'static str {
+    "Usage: squad autopilot launch --run-id <id> [--execute] [--terminal-backend <tmux|macos-terminal>] [--tmux-session <name>] [--terminal-title <name>]"
+}
+
+fn cmd_autopilot_launch(options: &AutopilotLaunchOptions) -> Result<()> {
+    let workspace = find_workspace()?;
+    let store = open_store(&workspace)?;
+    let launch_started_at = chrono::Utc::now().timestamp();
+    let run_id = options.run_id;
+    let run = store
+        .get_autopilot_run(run_id)?
+        .with_context(|| format!("autopilot run does not exist: {run_id}"))?;
+    let agents = store.list_autopilot_agents(run_id)?;
+    if agents.is_empty() {
+        bail!("autopilot run {run_id} has no generated agents");
+    }
+
+    let mut roles = Vec::with_capacity(agents.len());
+    let mut role_overrides = BTreeMap::new();
+    for agent in &agents {
+        let role_id = agent.role.trim();
+        if role_id.is_empty() {
+            bail!("autopilot agent {} has empty role", agent.id);
+        }
+        let provider: squad::autopilot::ModelProvider = agent.model_provider.parse()?;
+        roles.push(squad::autopilot::GeneratedTeamRole {
+            role_id: role_id.to_string(),
+            prompt_file: format!("generated/{role_id}"),
+        });
+        role_overrides.insert(role_id.to_string(), provider);
+    }
+    let config = squad::autopilot::AutopilotConfig {
+        role_overrides,
+        ..squad::autopilot::AutopilotConfig::default()
+    };
+    let sessions = scope_autopilot_terminal_sessions(
+        run_id,
+        squad::autopilot::plan_terminal_sessions(&workspace, &roles, &config)?,
+    );
+    let persisted_sessions = store.create_autopilot_terminal_sessions(run_id, &sessions)?;
+
+    println!("Autopilot launch plan for run {}", run.id);
+    println!("PRD: {}", run.prd_path);
+    println!("Sessions: {}", sessions.len());
+    println!("Persisted sessions: {}", persisted_sessions.len());
+    println!(
+        "Terminal backend: {}",
+        match options.terminal_backend {
+            AutopilotLaunchBackend::Tmux => "tmux",
+            AutopilotLaunchBackend::MacosTerminal => "macos-terminal",
+        }
+    );
+    for session in &sessions {
+        println!(
+            "- {} [{}] {} -> {}",
+            session.agent_id,
+            autopilot_session_role_label(&session.session_role),
+            session.model_provider,
+            session.command
+        );
+        println!("  inject: {}", session.inject_text);
+    }
+    if options.execute {
+        match options.terminal_backend {
+            AutopilotLaunchBackend::Tmux => {
+                let tmux_session = options
+                    .tmux_session
+                    .clone()
+                    .unwrap_or_else(|| format!("squad-autopilot-{run_id}"));
+                let delivery = execute_tmux_spawn_with_sequential_delivery(
+                    &store,
+                    run_id,
+                    &tmux_session,
+                    &sessions,
+                    launch_started_at.saturating_sub(1),
+                    autopilot_assignment_wait_secs(),
+                    autopilot_tasks_per_role(),
+                )?;
+                println!("Executed tmux launch: {tmux_session}");
+                println!("Attach with: tmux attach -t {tmux_session}");
+                println!(
+                    "Autopilot task delivery: {} created, {} already existed.",
+                    delivery.created, delivery.already_existed
+                );
+                if !delivery.missing_roles.is_empty() {
+                    println!(
+                        "Autopilot task delivery pending; missing active roles: {}",
+                        delivery.missing_roles.join(", ")
+                    );
+                }
+            }
+            AutopilotLaunchBackend::MacosTerminal => {
+                let terminal_title = options
+                    .terminal_title
+                    .clone()
+                    .unwrap_or_else(|| format!("squad-autopilot-{run_id}"));
+                let delivery = execute_macos_terminal_spawn_with_sequential_delivery(
+                    &store,
+                    run_id,
+                    &terminal_title,
+                    &sessions,
+                    launch_started_at.saturating_sub(1),
+                    autopilot_assignment_wait_secs(),
+                    autopilot_tasks_per_role(),
+                )?;
+                println!("Executed macOS Terminal launch: {terminal_title}");
+                println!("Opened physical Terminal.app windows.");
+                println!(
+                    "Terminal.app prompt injection waits for each provider and submits the squad command."
+                );
+                println!(
+                    "Autopilot task delivery: {} created, {} already existed.",
+                    delivery.created, delivery.already_existed
+                );
+                if !delivery.missing_roles.is_empty() {
+                    println!(
+                        "Autopilot task delivery pending; missing active roles: {}",
+                        delivery.missing_roles.join(", ")
+                    );
+                }
+            }
+        }
+    } else {
+        println!("Dry run only. Add --execute to create terminal windows.");
+    }
+    Ok(())
+}
+
+fn scope_autopilot_terminal_sessions(
+    run_id: i64,
+    sessions: Vec<squad::autopilot::TerminalSessionPlan>,
+) -> Vec<squad::autopilot::TerminalSessionPlan> {
+    sessions
+        .into_iter()
+        .map(|mut session| {
+            let agent_id = format!("{}-r{run_id}", session.role_id);
+            session.agent_id = agent_id.clone();
+            session.pane_label = agent_id.clone();
+            session.inject_text = squad::autopilot::role_specific_injection_text(
+                &session.model_provider,
+                &session.role_id,
+                &agent_id,
+            );
+            session
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AutopilotTaskDelivery {
+    created: usize,
+    already_existed: usize,
+    missing_roles: Vec<String>,
+    created_task_ids: Vec<String>,
+}
+
+impl AutopilotTaskDelivery {
+    fn add(&mut self, other: AutopilotTaskDelivery) {
+        self.created += other.created;
+        self.already_existed += other.already_existed;
+        self.created_task_ids.extend(other.created_task_ids);
+        for role in other.missing_roles {
+            if !self.missing_roles.contains(&role) {
+                self.missing_roles.push(role);
+            }
+        }
+    }
+}
+
+fn autopilot_assignment_wait_secs() -> u64 {
+    std::env::var("SQUAD_AUTOPILOT_ASSIGN_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_AUTOPILOT_ASSIGN_WAIT_SECS)
+}
+
+fn autopilot_tasks_per_role() -> usize {
+    std::env::var("SQUAD_AUTOPILOT_TASKS_PER_ROLE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUTOPILOT_TASKS_PER_ROLE)
+}
+
+fn execute_tmux_spawn_with_sequential_delivery(
+    store: &squad::store::Store,
+    run_id: i64,
+    tmux_session: &str,
+    sessions: &[squad::autopilot::TerminalSessionPlan],
+    joined_at_or_after: i64,
+    wait_secs: u64,
+    tasks_per_role: usize,
+) -> Result<AutopilotTaskDelivery> {
+    execute_terminal_spawn_with_sequential_delivery(
+        store,
+        run_id,
+        sessions,
+        joined_at_or_after,
+        wait_secs,
+        tasks_per_role,
+        "tmux",
+        |session| squad::autopilot::execute_tmux_spawn_one(tmux_session, session),
+    )
+}
+
+fn execute_macos_terminal_spawn_with_sequential_delivery(
+    store: &squad::store::Store,
+    run_id: i64,
+    terminal_title: &str,
+    sessions: &[squad::autopilot::TerminalSessionPlan],
+    joined_at_or_after: i64,
+    wait_secs: u64,
+    tasks_per_role: usize,
+) -> Result<AutopilotTaskDelivery> {
+    execute_terminal_spawn_with_sequential_delivery(
+        store,
+        run_id,
+        sessions,
+        joined_at_or_after,
+        wait_secs,
+        tasks_per_role,
+        "macOS Terminal",
+        |session| squad::autopilot::execute_macos_terminal_spawn_one(terminal_title, session),
+    )
+}
+
+fn execute_terminal_spawn_with_sequential_delivery<F>(
+    store: &squad::store::Store,
+    run_id: i64,
+    sessions: &[squad::autopilot::TerminalSessionPlan],
+    joined_at_or_after: i64,
+    wait_secs: u64,
+    tasks_per_role: usize,
+    backend_label: &str,
+    mut launch_session: F,
+) -> Result<AutopilotTaskDelivery>
+where
+    F: FnMut(&squad::autopilot::TerminalSessionPlan) -> Result<()>,
+{
+    if sessions.is_empty() {
+        bail!("{backend_label} spawn command list cannot be empty");
+    }
+    let manager_session = sessions
+        .iter()
+        .find(|session| {
+            session.role_id == "manager"
+                || session.session_role == squad::autopilot::TerminalSessionRole::Manager
+        })
+        .with_context(|| "autopilot launch requires a manager terminal session")?;
+
+    let mut ordered_sessions = vec![manager_session];
+    for session in sessions {
+        if !std::ptr::eq(session, manager_session) {
+            ordered_sessions.push(session);
+        }
+    }
+
+    let mut delivery = AutopilotTaskDelivery::default();
+    for session in ordered_sessions {
+        println!(
+            "Sequential {backend_label} launch: launching {} ({})",
+            session.role_id, session.model_provider
+        );
+        launch_session(session)?;
+
+        let needed_roles = if session.role_id == "manager" {
+            vec!["manager".to_string()]
+        } else {
+            vec!["manager".to_string(), session.role_id.clone()]
+        };
+        let active_agents =
+            wait_for_active_autopilot_roles(store, &needed_roles, joined_at_or_after, wait_secs)?;
+        let missing_roles: Vec<String> = needed_roles
+            .iter()
+            .filter(|role| !active_agents.contains_key(role.as_str()))
+            .cloned()
+            .collect();
+        if !missing_roles.is_empty() {
+            println!(
+                "Sequential {backend_label} launch stopped; missing active roles: {}",
+                missing_roles.join(", ")
+            );
+            delivery.add(AutopilotTaskDelivery {
+                created: 0,
+                already_existed: 0,
+                missing_roles,
+                created_task_ids: Vec::new(),
+            });
+            return Ok(delivery);
+        }
+
+        let Some(manager_id) = active_agents.get("manager") else {
+            continue;
+        };
+        let Some(assigned_to) = active_agents.get(session.role_id.as_str()) else {
+            continue;
+        };
+        let role_delivery = deliver_ready_autopilot_tasks_for_role(
+            store,
+            run_id,
+            manager_id,
+            &session.role_id,
+            assigned_to,
+            tasks_per_role,
+        )?;
+        println!(
+            "Sequential task delivery for {}: {} created, {} already existed.",
+            session.role_id, role_delivery.created, role_delivery.already_existed
+        );
+        if !wait_for_squad_tasks_to_start(store, &role_delivery.created_task_ids, wait_secs)? {
+            println!(
+                "Sequential {backend_label} launch stopped; {} did not ack or complete its assigned task.",
+                session.role_id
+            );
+            delivery.add(AutopilotTaskDelivery {
+                created: role_delivery.created,
+                already_existed: role_delivery.already_existed,
+                missing_roles: vec![session.role_id.clone()],
+                created_task_ids: role_delivery.created_task_ids,
+            });
+            return Ok(delivery);
+        }
+        delivery.add(role_delivery);
+    }
+    Ok(delivery)
+}
+
+fn deliver_ready_autopilot_tasks_for_role(
+    store: &squad::store::Store,
+    run_id: i64,
+    manager_id: &str,
+    role: &str,
+    assigned_to: &str,
+    task_limit: usize,
+) -> Result<AutopilotTaskDelivery> {
+    let autopilot_agents = store.list_autopilot_agents(run_id)?;
+    let roles_by_autopilot_agent_id: BTreeMap<i64, String> = autopilot_agents
+        .into_iter()
+        .map(|agent| (agent.id, agent.role))
+        .collect();
+    let mut delivery = AutopilotTaskDelivery::default();
+    for task in store.list_autopilot_tasks(run_id)? {
+        if task.status != "READY_PARALLEL" {
+            continue;
+        }
+        let Some(autopilot_agent_id) = task.assigned_agent_id else {
+            continue;
+        };
+        if roles_by_autopilot_agent_id
+            .get(&autopilot_agent_id)
+            .map(|assigned_role| assigned_role != role)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if autopilot_task_has_squad_delivery(store, task.id)? {
+            delivery.already_existed += 1;
+            continue;
+        }
+        let squad_task_id = store.create_task(
+            manager_id,
+            assigned_to,
+            &format!("Autopilot task {}: {}", task.id, task.title),
+            &autopilot_squad_task_body(run_id, &task),
+        )?;
+        delivery.created += 1;
+        delivery.created_task_ids.push(squad_task_id);
+        if delivery.created >= task_limit {
+            break;
+        }
+    }
+    Ok(delivery)
+}
+
+fn wait_for_squad_tasks_to_start(
+    store: &squad::store::Store,
+    task_ids: &[String],
+    wait_secs: u64,
+) -> Result<bool> {
+    if task_ids.is_empty() || wait_secs == 0 {
+        return Ok(true);
+    }
+    let deadline = chrono::Utc::now().timestamp() + wait_secs as i64;
+    loop {
+        let mut all_started = true;
+        for task_id in task_ids {
+            let Some(task) = store.get_task(task_id)? else {
+                all_started = false;
+                break;
+            };
+            if task.status == "queued" && !squad_task_assignment_was_read(store, task_id)? {
+                all_started = false;
+                break;
+            }
+        }
+        if all_started {
+            return Ok(true);
+        }
+        if chrono::Utc::now().timestamp() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn squad_task_assignment_was_read(store: &squad::store::Store, task_id: &str) -> Result<bool> {
+    Ok(store.all_messages(None)?.iter().any(|message| {
+        message.kind == "task_assigned"
+            && message.read
+            && message.task_id.as_deref() == Some(task_id)
+    }))
+}
+
+fn wait_for_active_autopilot_roles(
+    store: &squad::store::Store,
+    roles: &[String],
+    joined_at_or_after: i64,
+    wait_secs: u64,
+) -> Result<BTreeMap<String, String>> {
+    let deadline = chrono::Utc::now().timestamp() + wait_secs as i64;
+    loop {
+        let active_agents = newest_active_agents_by_role(store, joined_at_or_after)?;
+        let all_present = roles
+            .iter()
+            .all(|role| active_agents.contains_key(role.as_str()));
+        if all_present || wait_secs == 0 || chrono::Utc::now().timestamp() >= deadline {
+            return Ok(active_agents);
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn newest_active_agents_by_role(
+    store: &squad::store::Store,
+    joined_at_or_after: i64,
+) -> Result<BTreeMap<String, String>> {
+    let mut newest: BTreeMap<String, (String, i64)> = BTreeMap::new();
+    for agent in store.list_agents(false)? {
+        if agent.joined_at < joined_at_or_after {
+            continue;
+        }
+        let replace = newest
+            .get(&agent.role)
+            .map(|(_, joined_at)| agent.joined_at >= *joined_at)
+            .unwrap_or(true);
+        if replace {
+            newest.insert(agent.role, (agent.id, agent.joined_at));
+        }
+    }
+    Ok(newest
+        .into_iter()
+        .map(|(role, (id, _))| (role, id))
+        .collect())
+}
+
+fn autopilot_task_has_squad_delivery(
+    store: &squad::store::Store,
+    autopilot_task_id: i64,
+) -> Result<bool> {
+    let marker = autopilot_squad_task_marker(autopilot_task_id);
+    Ok(store
+        .list_tasks(None, None)?
+        .iter()
+        .any(|task| task.body.contains(&marker)))
+}
+
+fn autopilot_squad_task_marker(autopilot_task_id: i64) -> String {
+    format!("Autopilot-Task-ID: {autopilot_task_id}")
+}
+
+fn autopilot_squad_task_body(run_id: i64, task: &squad::store::AutopilotTaskRecord) -> String {
+    let acceptance = if task.acceptance_criteria.is_empty() {
+        "- Not specified".to_string()
+    } else {
+        task.acceptance_criteria
+            .iter()
+            .map(|criterion| format!("- {criterion}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "{}\nAutopilot-Run-ID: {run_id}\n\n{}\n\nAcceptance criteria:\n{}\n\nAfter completing the work, run `squad task complete <your-id> <task-id> --summary \"<summary>\"` and include changed files, tests run, and unresolved risks.",
+        autopilot_squad_task_marker(task.id),
+        task.description,
+        acceptance
+    )
+}
+
+fn cmd_autopilot_plan(prd_path: &str) -> Result<()> {
+    let prd_path = Path::new(prd_path);
+    let document = squad::autopilot::ingest_prd_file(prd_path)?;
+    let mut graph =
+        squad::autopilot::extract_prd_task_graph_basics(&document.display_path, &document.content);
+    squad::autopilot::classify_task_graph_statuses(&mut graph)?;
+
+    println!("Autopilot plan for {}", document.display_path);
+    println!("Tasks: {}", graph.tasks.len());
+    for status in [
+        squad::autopilot::TaskGraphStatus::ReadyParallel,
+        squad::autopilot::TaskGraphStatus::Blocked,
+        squad::autopilot::TaskGraphStatus::Sequential,
+        squad::autopilot::TaskGraphStatus::ReviewRequired,
+        squad::autopilot::TaskGraphStatus::Done,
+        squad::autopilot::TaskGraphStatus::Failed,
+    ] {
+        let count = graph
+            .tasks
+            .iter()
+            .filter(|task| task.status == status)
+            .count();
+        println!("{}: {}", autopilot_status_label(&status), count);
+    }
+    println!();
+    print_autopilot_plan_section(
+        "Ready Parallel",
+        &graph,
+        &squad::autopilot::TaskGraphStatus::ReadyParallel,
+    );
+    print_autopilot_plan_section(
+        "Blocked",
+        &graph,
+        &squad::autopilot::TaskGraphStatus::Blocked,
+    );
+    print_autopilot_plan_section(
+        "Sequential",
+        &graph,
+        &squad::autopilot::TaskGraphStatus::Sequential,
+    );
+    print_autopilot_plan_section(
+        "Review Required",
+        &graph,
+        &squad::autopilot::TaskGraphStatus::ReviewRequired,
+    );
+    Ok(())
+}
+
+fn cmd_autopilot_run(prd_path: &str) -> Result<()> {
+    let workspace = find_workspace()?;
+    let _init = squad::autopilot::init_autopilot_workspace(&workspace)?;
+    let store = open_store(&workspace)?;
+    let config = squad::autopilot::load_config(&workspace)?;
+    let document = squad::autopilot::ingest_prd_file(Path::new(prd_path))?;
+    let mut graph =
+        squad::autopilot::extract_prd_task_graph_basics(&document.display_path, &document.content);
+    squad::autopilot::classify_task_graph_statuses(&mut graph)?;
+
+    let context = autopilot_role_context_from_graph(&graph);
+    let specs = squad::autopilot::synthesize_role_specs_from_prd(&context);
+    let specs = squad::autopilot::apply_model_policy_to_role_specs(&specs, &config);
+    let generated_roles = squad::autopilot::write_generated_roles(&workspace, &context, &specs)?;
+    let team_path = squad::autopilot::write_autopilot_team(&workspace, &generated_roles)?;
+    let science_artifacts =
+        squad::autopilot::write_science_swarm_artifacts(&workspace, &graph, &specs)?;
+
+    let run = store.create_autopilot_run(&document.display_path)?;
+    let agent_inputs: Vec<squad::store::AutopilotAgentInput> = specs
+        .iter()
+        .map(|spec| squad::store::AutopilotAgentInput {
+            name: spec.role_name.clone(),
+            role: spec.role_id.clone(),
+            model_provider: spec.model_provider.as_str().to_string(),
+            skills_prompt: spec.skills_prompt.clone(),
+        })
+        .collect();
+    let agents = store.create_autopilot_agents(run.id, &agent_inputs)?;
+    let tasks = store.create_autopilot_tasks(run.id, &graph.tasks)?;
+    let session_config = squad::autopilot::AutopilotConfig {
+        model_mix: config.model_mix.clone(),
+        adaptive_scheduling: config.adaptive_scheduling.clone(),
+        role_overrides: specs
+            .iter()
+            .map(|spec| (spec.role_id.clone(), spec.model_provider.clone()))
+            .collect(),
+    };
+    let sessions =
+        squad::autopilot::plan_terminal_sessions(&workspace, &generated_roles, &session_config)?;
+    let persisted_sessions = store.create_autopilot_terminal_sessions(run.id, &sessions)?;
+    let assigned_tasks = store.assign_ready_autopilot_tasks(run.id)?;
+
+    let test_records = squad::autopilot::record_test_run(
+        &workspace,
+        squad::autopilot::TestRunRecord {
+            command: "cargo test".to_string(),
+            status: squad::autopilot::TestRunStatus::Skipped,
+            exit_code: None,
+            task_id: None,
+            agent_id: Some("manager".to_string()),
+            notes: Some(
+                "autopilot run initialized test checkpoint; execute after worker changes"
+                    .to_string(),
+            ),
+        },
+    )?;
+    let accepted = store.autopilot_run_acceptance_satisfied(run.id)?;
+    let detected_files = squad::autopilot::detect_git_files_changed(&workspace)?;
+    let files_changed = squad::autopilot::record_files_changed(&workspace, &detected_files)?;
+    let failures_retries = squad::autopilot::read_failures_retries(&workspace)?;
+    let persisted_tasks = store.list_autopilot_tasks(run.id)?;
+    let final_report = squad::autopilot::FinalReport {
+        product_goals: graph.product_goals.clone(),
+        milestones: graph.milestones.clone(),
+        acceptance_criteria: graph.acceptance_criteria.clone(),
+        test_requirements: graph.test_requirements.clone(),
+        prd_tasks_completed: autopilot_completed_task_lines(&persisted_tasks),
+        task_graph: autopilot_task_graph_report_lines(&graph),
+        agents_used: autopilot_agents_report_lines(&agents),
+        model_mix_used: autopilot_model_mix_report_lines(&config),
+        files_changed,
+        tests_run: squad::autopilot::tests_run_report_lines(&test_records),
+        failures_retries: squad::autopilot::failures_retries_report_lines(&failures_retries),
+        unresolved_risks: autopilot_unresolved_risk_lines(&graph, accepted),
+        final_git_diff_summary: squad::autopilot::git_diff_stat_summary(&workspace)?,
+    };
+    let final_report_path = squad::autopilot::write_final_report(&workspace, &final_report)?;
+    if accepted {
+        let _ = store.complete_autopilot_run_if_accepted(run.id)?;
+    }
+
+    println!("Autopilot run initialized: {}", run.id);
+    println!("PRD: {}", document.display_path);
+    println!("Team: {}", team_path.display());
+    println!("Science swarm artifacts: {}", science_artifacts.len());
+    println!("Agents: {}", agents.len());
+    println!("Tasks: {}", tasks.len());
+    println!("Sessions planned: {}", persisted_sessions.len());
+    println!("Ready tasks assigned: {}", assigned_tasks.len());
+    println!("Tests recorded: {}", test_records.len());
+    println!("Final report: {}", final_report_path.display());
+    println!(
+        "Acceptance criteria: {}",
+        if accepted { "passed" } else { "pending" }
+    );
+    println!("Next: squad autopilot launch --run-id {}", run.id);
+    Ok(())
+}
+
+fn autopilot_role_context_from_graph(
+    graph: &squad::autopilot::TaskGraph,
+) -> squad::autopilot::PrdRoleContext {
+    squad::autopilot::PrdRoleContext {
+        prd_path: graph.prd_path.clone(),
+        product_goal: graph.product_goals.join("\n"),
+        milestones: graph.milestones.clone(),
+        implementation_tasks: graph.tasks.iter().map(|task| task.title.clone()).collect(),
+        acceptance_criteria: graph.acceptance_criteria.clone(),
+        risky_areas: graph.risky_areas.clone(),
+        likely_files: graph
+            .tasks
+            .iter()
+            .flat_map(|task| task.likely_files.clone())
+            .collect(),
+        test_requirements: graph.test_requirements.clone(),
+    }
+}
+
+fn autopilot_completed_task_lines(tasks: &[squad::store::AutopilotTaskRecord]) -> Vec<String> {
+    tasks
+        .iter()
+        .filter(|task| task.status == "DONE")
+        .map(|task| format!("{}: {}", task.id, task.title))
+        .collect()
+}
+
+fn autopilot_task_graph_report_lines(graph: &squad::autopilot::TaskGraph) -> Vec<String> {
+    graph
+        .tasks
+        .iter()
+        .map(|task| {
+            let dependencies = if task.depends_on.is_empty() {
+                "none".to_string()
+            } else {
+                task.depends_on.join(", ")
+            };
+            format!(
+                "{} [{}] {} (depends on: {})",
+                task.id,
+                autopilot_status_label(&task.status),
+                task.title,
+                dependencies
+            )
+        })
+        .collect()
+}
+
+fn autopilot_agents_report_lines(agents: &[squad::store::AutopilotAgentRecord]) -> Vec<String> {
+    agents
+        .iter()
+        .map(|agent| format!("{}: {} ({})", agent.role, agent.name, agent.model_provider))
+        .collect()
+}
+
+fn autopilot_model_mix_report_lines(config: &squad::autopilot::AutopilotConfig) -> Vec<String> {
+    let mut lines = vec![
+        format!("claude {:.0}%", config.model_mix.claude * 100.0),
+        format!("codex {:.0}%", config.model_mix.codex * 100.0),
+        format!("gemini {:.0}%", config.model_mix.gemini * 100.0),
+        format!(
+            "openrouter_free {:.0}%",
+            config.model_mix.openrouter_free * 100.0
+        ),
+        format!(
+            "openrouter_cheap {:.0}%",
+            config.model_mix.openrouter_cheap * 100.0
+        ),
+        format!("local {:.0}%", config.model_mix.local * 100.0),
+    ];
+    lines.extend(
+        config
+            .role_overrides
+            .iter()
+            .map(|(role, provider)| format!("{role} override: {provider}")),
+    );
+    lines
+}
+
+fn autopilot_unresolved_risk_lines(
+    graph: &squad::autopilot::TaskGraph,
+    accepted: bool,
+) -> Vec<String> {
+    let mut risks = graph.risky_areas.clone();
+    if !accepted {
+        risks.push("Autopilot run initialized; acceptance criteria are still pending.".to_string());
+    }
+    risks
+}
+
+fn print_autopilot_plan_section(
+    title: &str,
+    graph: &squad::autopilot::TaskGraph,
+    status: &squad::autopilot::TaskGraphStatus,
+) {
+    println!("{title}:");
+    let tasks: Vec<&squad::autopilot::TaskGraphTask> = graph
+        .tasks
+        .iter()
+        .filter(|task| task.status == *status)
+        .collect();
+    if tasks.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    for task in tasks {
+        println!("  - {} {}", task.id, task.title);
+        if !task.depends_on.is_empty() {
+            println!("    depends on: {}", task.depends_on.join(", "));
+        }
+        if let Some(role) = task.assigned_role.as_deref() {
+            println!("    role: {role}");
+        }
+    }
+}
+
+fn autopilot_status_label(status: &squad::autopilot::TaskGraphStatus) -> &'static str {
+    match status {
+        squad::autopilot::TaskGraphStatus::ReadyParallel => "READY_PARALLEL",
+        squad::autopilot::TaskGraphStatus::Blocked => "BLOCKED",
+        squad::autopilot::TaskGraphStatus::Sequential => "SEQUENTIAL",
+        squad::autopilot::TaskGraphStatus::ReviewRequired => "REVIEW_REQUIRED",
+        squad::autopilot::TaskGraphStatus::Done => "DONE",
+        squad::autopilot::TaskGraphStatus::Failed => "FAILED",
+    }
+}
+
+fn autopilot_session_role_label(role: &squad::autopilot::TerminalSessionRole) -> &'static str {
+    match role {
+        squad::autopilot::TerminalSessionRole::Manager => "manager",
+        squad::autopilot::TerminalSessionRole::Inspector => "inspector",
+        squad::autopilot::TerminalSessionRole::Worker => "worker",
+    }
 }
 
 fn cmd_join(id: &str, options: &JoinOptions) -> Result<()> {
@@ -1293,6 +2217,11 @@ COMMANDS
                                              Requeue a task, optionally to a new assignee
   squad task list [--agent <id>] [--status <status>]
                                              List tasks with optional filters
+  squad autopilot init                       Initialize Autopilot config and generated-role/team directories
+  squad autopilot plan <PRD.md>              Read a PRD and print an Autopilot task status summary
+  squad autopilot run <PRD.md>               Create an Autopilot run, team, graph, sessions, and initial assignments
+  squad autopilot launch --run-id <id> [--execute] [--terminal-backend <tmux|macos-terminal>]
+                                             Print planned terminal sessions; `--execute` creates tmux or Terminal.app windows
   squad pending                              Show all unread messages
   squad history [agent] [--from <id>] [--to <id>] [--since <RFC3339|unix-seconds>]
                                              Show messages with timestamps and optional filters

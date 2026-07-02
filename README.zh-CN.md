@@ -132,7 +132,7 @@ scripts/squad-tmux-launch.sh /path/to/project --dry-run
 | `squad leave <id>` | 归档 Agent，并保留未读工作 |
 | `squad agents [--all] [--json]` | 列出在线 Agent（`--json` 每行输出一个 JSON 对象，包含原始/生效能力字段和基于协议版本推导的支持布尔值） |
 | `squad send [--task-id <id>] [--reply-to <message-id>] <from> <to> <message>` | 发送普通消息（`@all` 广播给所有人，或用 `squad send [flags] --file <path-or-> <from> <to>` 从文件/标准输入读取内容） |
-| `squad receive <id> [--wait] [--timeout N] [--json]` | 检查收件箱（`--wait` 阻塞等待直到消息到达；`--json` 每行输出一个 JSON 对象） |
+| `squad receive <id> [--wait] [--json]` | 检查收件箱（`--wait` 仅用于调试；`--json` 每行输出一个 JSON 对象） |
 | `squad task create <from> <to> --title <title> [--body <body>]` | 创建结构化任务分配 |
 | `squad task ack <agent> <task-id>` | 领取排队中的任务 |
 | `squad task complete <agent> <task-id> --summary <text>` | 用结果摘要完成已 ack 的任务 |
@@ -196,21 +196,17 @@ Agent 通过共享的 SQLite 数据库（`.squad/messages.db`）通信。每个 
 
 所有消息通过 SQLite 传递 — 无守护进程、无 socket、无后台进程。
 
-### 消息流程
+### 检查消息
 
-当任务状态需要被显式跟踪时，Agent 应优先使用 `squad task ...`；`squad send` / `squad receive` 仍然是自由协作的兜底路径。Agent 使用 `squad receive --wait` 阻塞等待消息：
+当任务状态需要被显式跟踪时，Agent 应优先使用 `squad task ...`；`squad send` / `squad receive` 仍然是自由协作的兜底路径。完成工作后，Agent 会检查新消息：
 
 ```
-Agent 加入
-  → squad receive <id> --wait          ← 阻塞等待消息到达
-  → 收到 Manager 分配的任务
-  → squad task ack <id> <task-id>
-  → 执行任务
-  → squad task complete <id> <task-id> --summary "完成：摘要..."
-  → squad receive <id> --wait          ← 再次阻塞等待下一条消息
+Agent 完成任务
+  → squad send <id> manager "完成：摘要..."
+  → squad receive <id>                 ← 检查下一个任务
+  → 如果没有消息，继续其他工作
+  → 准备好时再检查
 ```
-
-`squad receive <id>`（不带 `--wait`）检查一次后立即返回，适用于脚本或手动检查。
 
 ### ID 自动后缀
 

@@ -1,3 +1,4 @@
+pub mod autopilot;
 pub mod init;
 pub mod roles;
 pub mod session;

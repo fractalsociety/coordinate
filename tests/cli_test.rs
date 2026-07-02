@@ -2,7 +2,9 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use rusqlite::Connection;
 use serde_json::Value;
+use squad::autopilot::{RiskLevel, TaskGraphStatus, TaskGraphTask};
 use squad::setup::{command_content, current_version, PLATFORMS};
+use squad::store::{AutopilotAgentInput, Store};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
@@ -18,6 +20,28 @@ fn make_executable(path: &std::path::Path) {
 fn create_fake_binary(dir: &std::path::Path, name: &str) {
     let path = dir.join(name);
     std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    make_executable(&path);
+}
+
+fn create_fake_tmux(dir: &std::path::Path) {
+    let path = dir.join("tmux");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TMUX_LOG\"\nstate=\"$TMUX_LOG.session\"\nif [ \"$1\" = \"has-session\" ]; then [ -f \"$state\" ] && exit 0 || exit 1; fi\nif [ \"$1\" = \"new-session\" ]; then : > \"$state\"; fi\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    make_executable(&path);
+}
+
+fn create_fake_osascript(dir: &std::path::Path) {
+    let path = dir.join("osascript");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$OSASCRIPT_LOG\"\nexit 0\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     make_executable(&path);
 }
@@ -84,6 +108,26 @@ fn path_with_fake_binary(tmp: &TempDir, binary: &str) -> String {
     }
 }
 
+fn path_with_fake_tmux(tmp: &TempDir) -> String {
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    create_fake_tmux(&bin_dir);
+    match std::env::var("PATH") {
+        Ok(existing) => format!("{}:{}", bin_dir.display(), existing),
+        Err(_) => bin_dir.display().to_string(),
+    }
+}
+
+fn path_with_fake_osascript(tmp: &TempDir) -> String {
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    create_fake_osascript(&bin_dir);
+    match std::env::var("PATH") {
+        Ok(existing) => format!("{}:{}", bin_dir.display(), existing),
+        Err(_) => bin_dir.display().to_string(),
+    }
+}
+
 #[test]
 fn test_init() {
     let tmp = TempDir::new().unwrap();
@@ -117,6 +161,582 @@ fn test_init_refresh_roles_updates_builtin_files_only() {
         std::fs::read_to_string(roles_dir.join("custom.md")).unwrap(),
         "keep custom"
     );
+}
+
+#[test]
+fn test_autopilot_init_creates_config_and_directories() {
+    let tmp = TempDir::new().unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Initialized squad autopilot workspace.",
+        ))
+        .stdout(predicate::str::contains("Created config:"));
+
+    assert!(tmp.path().join(".squad").exists());
+    assert!(tmp.path().join(".squad").join("autopilot.toml").exists());
+    assert!(tmp.path().join(".squad").join("autopilot").exists());
+    assert!(tmp
+        .path()
+        .join(".squad")
+        .join("roles")
+        .join("generated")
+        .exists());
+    assert!(tmp.path().join(".squad").join("teams").exists());
+
+    let config = std::fs::read_to_string(tmp.path().join(".squad").join("autopilot.toml")).unwrap();
+    assert!(config.contains("[role_overrides]"));
+    assert!(config.contains("manager = \"codex\""));
+    assert!(config.contains("scientific_planner = \"codex\""));
+    assert!(config.contains("literature_worker = \"codex\""));
+    assert!(config.contains("claude_coding_worker = \"claude\""));
+    assert!(config.contains("test_worker = \"codex\""));
+    assert!(config.contains("trace_collector = \"codex\""));
+    assert!(config.contains("claude = 0.20"));
+    assert!(config.contains("codex = 0.80"));
+    assert!(config.contains("claude_coding_only = true"));
+    assert!(config.contains("codex_backfill_when_waiting_on_claude = true"));
+    assert!(config.contains("gemini = 0.00"));
+    assert!(config.contains("openrouter_free = 0.00"));
+    assert!(config.contains("local = 0.00"));
+}
+
+#[test]
+fn test_autopilot_init_does_not_overwrite_existing_config() {
+    let tmp = TempDir::new().unwrap();
+    squad(tmp.path()).arg("init").assert().success();
+    let config_path = tmp.path().join(".squad").join("autopilot.toml");
+    std::fs::write(&config_path, "[role_overrides]\ndocs = \"gemini\"\n").unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config already exists:"));
+
+    assert_eq!(
+        std::fs::read_to_string(config_path).unwrap(),
+        "[role_overrides]\ndocs = \"gemini\"\n"
+    );
+}
+
+#[test]
+fn test_autopilot_plan_reads_prd_and_prints_status_summary() {
+    let tmp = TempDir::new().unwrap();
+    let prd_path = tmp.path().join("PRD.md");
+    std::fs::write(
+        &prd_path,
+        r#"
+Product Goal
+Build an autopilot planner.
+
+Implementation Task Checklist
+[ ] 1. Add schema - Sequential
+[ ] 2. Add docs - Parallel
+[ ] 3. Wire command - Parallel
+
+Dependencies
+3 depends on 1
+"#,
+    )
+    .unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "plan", "PRD.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Autopilot plan for PRD.md"))
+        .stdout(predicate::str::contains("Tasks: 3"))
+        .stdout(predicate::str::contains("READY_PARALLEL: 1"))
+        .stdout(predicate::str::contains("BLOCKED: 1"))
+        .stdout(predicate::str::contains("SEQUENTIAL: 1"))
+        .stdout(predicate::str::contains("Ready Parallel:"))
+        .stdout(predicate::str::contains("- task-2 Add docs"))
+        .stdout(predicate::str::contains("Blocked:"))
+        .stdout(predicate::str::contains("- task-3 Wire command"))
+        .stdout(predicate::str::contains("depends on: task-1"))
+        .stdout(predicate::str::contains("Sequential:"))
+        .stdout(predicate::str::contains("- task-1 Add schema"));
+}
+
+#[test]
+fn test_autopilot_plan_requires_prd_path() {
+    let tmp = TempDir::new().unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "plan"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Usage: squad autopilot plan <PRD.md>",
+        ));
+}
+
+#[test]
+fn test_autopilot_launch_prints_terminal_session_plan_for_run() {
+    let tmp = TempDir::new().unwrap();
+    squad(tmp.path()).arg("init").assert().success();
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let run = store.create_autopilot_run("./PRD.md").unwrap();
+    store
+        .create_autopilot_agents(
+            run.id,
+            &[
+                AutopilotAgentInput {
+                    name: "Autopilot Manager".to_string(),
+                    role: "manager".to_string(),
+                    model_provider: "codex".to_string(),
+                    skills_prompt: "Coordinate work.".to_string(),
+                },
+                AutopilotAgentInput {
+                    name: "Inspector".to_string(),
+                    role: "inspector".to_string(),
+                    model_provider: "claude".to_string(),
+                    skills_prompt: "Review work.".to_string(),
+                },
+                AutopilotAgentInput {
+                    name: "Rust Backend Engineer".to_string(),
+                    role: "rust_backend".to_string(),
+                    model_provider: "codex".to_string(),
+                    skills_prompt: "Implement Rust changes.".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "launch", "--run-id", &run.id.to_string()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Autopilot launch plan for run {}",
+            run.id
+        )))
+        .stdout(predicate::str::contains("PRD: ./PRD.md"))
+        .stdout(predicate::str::contains("Sessions: 3"))
+        .stdout(predicate::str::contains("Persisted sessions: 3"))
+        .stdout(predicate::str::contains(format!(
+            "Terminal backend: {}",
+            if cfg!(target_os = "macos") {
+                "macos-terminal"
+            } else {
+                "tmux"
+            }
+        )))
+        .stdout(predicate::str::contains(
+            "- manager-r1 [manager] codex -> codex --yolo",
+        ))
+        .stdout(predicate::str::contains(
+            "- inspector-r1 [inspector] codex -> codex --yolo",
+        ))
+        .stdout(predicate::str::contains(
+            "- rust_backend-r1 [worker] codex -> codex --yolo",
+        ))
+        .stdout(predicate::str::contains(
+            "inject: $squad manager manager-r1",
+        ))
+        .stdout(predicate::str::contains(
+            "inject: $squad inspector inspector-r1",
+        ))
+        .stdout(predicate::str::contains(
+            "inject: $squad rust_backend rust_backend-r1",
+        ));
+
+    let persisted_sessions = store.list_autopilot_terminal_sessions(run.id).unwrap();
+    assert_eq!(persisted_sessions.len(), 3);
+    assert_eq!(persisted_sessions[0].command, "codex --yolo");
+    assert_eq!(persisted_sessions[2].command, "codex --yolo");
+}
+
+#[test]
+fn test_autopilot_launch_execute_runs_tmux_commands() {
+    let tmp = TempDir::new().unwrap();
+    squad(tmp.path()).arg("init").assert().success();
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let run = store.create_autopilot_run("./PRD.md").unwrap();
+    store
+        .create_autopilot_agents(
+            run.id,
+            &[
+                AutopilotAgentInput {
+                    name: "Autopilot Manager".to_string(),
+                    role: "manager".to_string(),
+                    model_provider: "claude".to_string(),
+                    skills_prompt: "Coordinate work.".to_string(),
+                },
+                AutopilotAgentInput {
+                    name: "Rust Backend Engineer".to_string(),
+                    role: "rust_backend".to_string(),
+                    model_provider: "codex".to_string(),
+                    skills_prompt: "Implement Rust changes.".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    store
+        .register_agent_with_metadata("manager", "manager", Some("codex"), Some(2))
+        .unwrap();
+    store
+        .register_agent_with_metadata("rust_backend", "rust_backend", Some("codex"), Some(2))
+        .unwrap();
+    let path_env = path_with_fake_tmux(&tmp);
+    let tmux_log = tmp.path().join("tmux.log");
+
+    squad(tmp.path())
+        .args([
+            "autopilot",
+            "launch",
+            "--run-id",
+            &run.id.to_string(),
+            "--execute",
+            "--tmux-session",
+            "test-autopilot",
+        ])
+        .env("PATH", path_env)
+        .env("TMUX_LOG", &tmux_log)
+        .env("SQUAD_AUTOPILOT_ASSIGN_WAIT_SECS", "0")
+        .env("SQUAD_AUTOPILOT_PROMPT_DELAY_SECS", "0")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Sequential tmux launch: launching manager",
+        ))
+        .stdout(predicate::str::contains(
+            "Executed tmux launch: test-autopilot",
+        ))
+        .stdout(predicate::str::contains(
+            "Attach with: tmux attach -t test-autopilot",
+        ));
+
+    let log = std::fs::read_to_string(tmux_log).unwrap();
+    assert!(log.contains("has-session -t test-autopilot"));
+    assert!(log.contains("new-session -d -s test-autopilot -n manager-r1"));
+    assert!(log.contains("codex --yolo"));
+    assert!(log.contains("send-keys -t test-autopilot:manager-r1 $squad manager manager-r1 C-m"));
+    assert!(log.contains("new-window -t test-autopilot -n rust_backend-r1"));
+    assert!(log.contains("codex --yolo"));
+    assert!(log.contains(
+        "send-keys -t test-autopilot:rust_backend-r1 $squad rust_backend rust_backend-r1 C-m"
+    ));
+}
+
+#[test]
+fn test_autopilot_launch_execute_runs_macos_terminal_commands() {
+    let tmp = TempDir::new().unwrap();
+    squad(tmp.path()).arg("init").assert().success();
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let run = store.create_autopilot_run("./PRD.md").unwrap();
+    store
+        .create_autopilot_agents(
+            run.id,
+            &[
+                AutopilotAgentInput {
+                    name: "Autopilot Manager".to_string(),
+                    role: "manager".to_string(),
+                    model_provider: "codex".to_string(),
+                    skills_prompt: "Coordinate work.".to_string(),
+                },
+                AutopilotAgentInput {
+                    name: "Rust Backend Engineer".to_string(),
+                    role: "rust_backend".to_string(),
+                    model_provider: "codex".to_string(),
+                    skills_prompt: "Implement Rust changes.".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    store
+        .register_agent_with_metadata("manager", "manager", Some("codex"), Some(2))
+        .unwrap();
+    store
+        .register_agent_with_metadata("rust_backend", "rust_backend", Some("codex"), Some(2))
+        .unwrap();
+    let path_env = path_with_fake_osascript(&tmp);
+    let osascript_log = tmp.path().join("osascript.log");
+
+    squad(tmp.path())
+        .args([
+            "autopilot",
+            "launch",
+            "--run-id",
+            &run.id.to_string(),
+            "--terminal-backend",
+            "macos-terminal",
+            "--execute",
+            "--terminal-title",
+            "test-autopilot",
+        ])
+        .env("PATH", path_env)
+        .env("OSASCRIPT_LOG", &osascript_log)
+        .env("SQUAD_AUTOPILOT_ASSIGN_WAIT_SECS", "0")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Terminal backend: macos-terminal"))
+        .stdout(predicate::str::contains(
+            "Sequential macOS Terminal launch: launching manager",
+        ))
+        .stdout(predicate::str::contains(
+            "Executed macOS Terminal launch: test-autopilot",
+        ))
+        .stdout(predicate::str::contains(
+            "Opened physical Terminal.app windows.",
+        ));
+
+    let log = std::fs::read_to_string(osascript_log).unwrap();
+    assert!(log.contains("tell application \"Terminal\""));
+    assert!(log.contains("test-autopilot - manager"));
+    assert!(log.contains("codex --yolo"));
+    assert!(log.contains("$squad manager manager"));
+    assert!(log.contains("test-autopilot - rust_backend"));
+    assert!(log.contains("codex --yolo"));
+    assert!(log.contains("$squad rust_backend rust_backend"));
+}
+
+#[test]
+fn test_autopilot_launch_execute_delivers_ready_assignments_to_squad_tasks() {
+    let tmp = TempDir::new().unwrap();
+    squad(tmp.path()).arg("init").assert().success();
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let run = store.create_autopilot_run("./PRD.md").unwrap();
+    store
+        .create_autopilot_agents(
+            run.id,
+            &[
+                AutopilotAgentInput {
+                    name: "Autopilot Manager".to_string(),
+                    role: "manager".to_string(),
+                    model_provider: "claude".to_string(),
+                    skills_prompt: "Coordinate work.".to_string(),
+                },
+                AutopilotAgentInput {
+                    name: "Rust Backend Engineer".to_string(),
+                    role: "rust_backend".to_string(),
+                    model_provider: "codex".to_string(),
+                    skills_prompt: "Implement Rust changes.".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    store
+        .create_autopilot_tasks(
+            run.id,
+            &[TaskGraphTask {
+                id: "task-1".to_string(),
+                title: "Implement queue bridge".to_string(),
+                description: "Create normal squad task assignments for launched agents."
+                    .to_string(),
+                assigned_role: Some("rust_backend".to_string()),
+                status: TaskGraphStatus::ReadyParallel,
+                priority: 10,
+                risk_level: RiskLevel::Medium,
+                acceptance_criteria: vec!["Worker receives a queued task.".to_string()],
+                likely_files: Vec::new(),
+                test_requirements: Vec::new(),
+                depends_on: Vec::new(),
+            }],
+        )
+        .unwrap();
+    store.assign_ready_autopilot_tasks(run.id).unwrap();
+    store
+        .register_agent_with_metadata("manager", "manager", Some("claude"), Some(2))
+        .unwrap();
+    store
+        .register_agent_with_metadata("rust_backend", "rust_backend", Some("codex"), Some(2))
+        .unwrap();
+
+    let path_env = path_with_fake_osascript(&tmp);
+    let osascript_log = tmp.path().join("osascript.log");
+
+    squad(tmp.path())
+        .args([
+            "autopilot",
+            "launch",
+            "--run-id",
+            &run.id.to_string(),
+            "--terminal-backend",
+            "macos-terminal",
+            "--execute",
+            "--terminal-title",
+            "test-autopilot",
+        ])
+        .env("PATH", path_env)
+        .env("OSASCRIPT_LOG", &osascript_log)
+        .env("SQUAD_AUTOPILOT_ASSIGN_WAIT_SECS", "0")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Sequential task delivery for rust_backend: 1 created, 0 already existed.",
+        ))
+        .stdout(predicate::str::contains(
+            "Autopilot task delivery: 1 created, 0 already existed.",
+        ));
+
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let tasks = store
+        .list_tasks(Some("rust_backend"), Some("queued"))
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].title.contains("Implement queue bridge"));
+    assert!(tasks[0].body.contains("Autopilot-Task-ID: 1"));
+
+    let inbox = store.receive_messages("rust_backend").unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].kind, "task_assigned");
+}
+
+#[test]
+fn test_autopilot_launch_requires_run_id_flag() {
+    let tmp = TempDir::new().unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "launch", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Usage: squad autopilot launch --run-id <id> [--execute] [--terminal-backend <tmux|macos-terminal>]",
+        ));
+}
+
+#[test]
+fn test_autopilot_run_creates_team_graph_sessions_and_assignments() {
+    let tmp = TempDir::new().unwrap();
+    squad(tmp.path()).arg("init").assert().success();
+    let prd_path = tmp.path().join("PRD.md");
+    std::fs::write(
+        &prd_path,
+        r#"
+Product Goal
+Build an autopilot runner for the Rust CLI.
+
+Milestones
+- MVP 1: Generate report
+
+Acceptance Criteria
+- Final report preserves PRD context.
+
+Implementation Task Checklist
+[ ] 1. Add schema persistence - Sequential
+[ ] 2. Add CLI docs - Parallel
+[ ] 3. Add tests - Parallel
+
+Test Requirements
+- cargo test
+"#,
+    )
+    .unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "run", "PRD.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Autopilot run initialized: 1"))
+        .stdout(predicate::str::contains("PRD: PRD.md"))
+        .stdout(predicate::str::contains("Agents:"))
+        .stdout(predicate::str::contains("Tasks: 3"))
+        .stdout(predicate::str::contains("Sessions planned:"))
+        .stdout(predicate::str::contains("Ready tasks assigned:"))
+        .stdout(predicate::str::contains("Tests recorded: 1"))
+        .stdout(predicate::str::contains("Final report:"))
+        .stdout(predicate::str::contains("Acceptance criteria: pending"))
+        .stdout(predicate::str::contains(
+            "Next: squad autopilot launch --run-id 1",
+        ));
+
+    assert!(tmp
+        .path()
+        .join(".squad")
+        .join("teams")
+        .join("autopilot.yaml")
+        .exists());
+    assert!(tmp
+        .path()
+        .join(".squad")
+        .join("autopilot")
+        .join("tests-run.json")
+        .exists());
+    let final_report_path = tmp
+        .path()
+        .join(".squad")
+        .join("autopilot")
+        .join("final-report.md");
+    assert!(final_report_path.exists());
+    let final_report = std::fs::read_to_string(final_report_path).unwrap();
+    assert!(final_report.contains("# Squad Autopilot Final Report"));
+    assert!(final_report.contains("## Product Goals"));
+    assert!(final_report.contains("Build an autopilot runner for the Rust CLI."));
+    assert!(final_report.contains("## Milestones"));
+    assert!(final_report.contains("MVP 1: Generate report"));
+    assert!(final_report.contains("## Acceptance Criteria"));
+    assert!(final_report.contains("Final report preserves PRD context."));
+    assert!(final_report.contains("## Test Requirements"));
+    assert!(final_report.contains("cargo test"));
+    assert!(final_report.contains("## PRD Tasks Completed"));
+    assert!(final_report.contains("## Task Graph"));
+    assert!(final_report.contains("task-1 [SEQUENTIAL] Add schema persistence"));
+    assert!(final_report.contains("task-2 [READY_PARALLEL] Add CLI docs"));
+    assert!(final_report.contains("## Agents Used"));
+    assert!(final_report.contains("manager: Autopilot Manager (codex)"));
+    assert!(final_report.contains("## Model Mix Used"));
+    assert!(final_report.contains("claude 20%"));
+    assert!(final_report.contains("codex 80%"));
+    assert!(final_report.contains("gemini 0%"));
+    assert!(final_report.contains("openrouter_free 0%"));
+    assert!(final_report.contains("openrouter_cheap 0%"));
+    assert!(final_report.contains("local 0%"));
+    assert!(final_report.contains("## Files Changed"));
+    assert!(final_report.contains("## Tests Run"));
+    assert!(final_report.contains("cargo test - skipped"));
+    assert!(final_report.contains("## Failures / Retries"));
+    assert!(final_report.contains("## Unresolved Risks"));
+    assert!(final_report.contains("acceptance criteria are still pending"));
+    assert!(final_report.contains("## Final Git Diff Summary"));
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let run = store.get_autopilot_run(1).unwrap().unwrap();
+    assert_eq!(run.status, "running");
+    assert_eq!(
+        store.list_autopilot_agents(run.id).unwrap().len() >= 3,
+        true
+    );
+    assert_eq!(store.list_autopilot_tasks(run.id).unwrap().len(), 3);
+    assert!(!store
+        .list_autopilot_terminal_sessions(run.id)
+        .unwrap()
+        .is_empty());
+    let session_count_after_run = store
+        .list_autopilot_terminal_sessions(run.id)
+        .unwrap()
+        .len();
+
+    squad(tmp.path())
+        .args(["autopilot", "launch", "--run-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Persisted sessions: {session_count_after_run}"
+        )));
+    assert_eq!(
+        store
+            .list_autopilot_terminal_sessions(run.id)
+            .unwrap()
+            .len(),
+        session_count_after_run
+    );
+}
+
+#[test]
+fn test_autopilot_rejects_unknown_subcommand() {
+    let tmp = TempDir::new().unwrap();
+
+    squad(tmp.path())
+        .args(["autopilot", "explode"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Usage: squad autopilot <init|plan|launch|run>",
+        ));
 }
 
 #[test]
@@ -782,11 +1402,11 @@ fn test_readmes_describe_receive_timeout_debug_path() {
     let readme = std::fs::read_to_string("README.md").unwrap();
     let readme_zh = std::fs::read_to_string("README.zh-CN.md").unwrap();
 
-    assert!(readme.contains("| `squad receive <id> [--wait] [--timeout N] [--json]` |"));
+    assert!(readme.contains("| `squad receive <id> [--wait] [--json]` |"));
     assert!(readme.contains("| `squad task create <from> <to> --title <title> [--body <body>]` |"));
     assert!(readme.contains("| `squad task complete <agent> <task-id> --summary <text>` |"));
     assert!(readme.contains("| `squad task list [--agent <id>] [--status <status>]` |"));
-    assert!(readme_zh.contains("| `squad receive <id> [--wait] [--timeout N] [--json]` |"));
+    assert!(readme_zh.contains("| `squad receive <id> [--wait] [--json]` |"));
     assert!(
         readme_zh.contains("| `squad task create <from> <to> --title <title> [--body <body>]` |")
     );
