@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 #[test]
-fn test_plan_manager_pane_defaults_to_claude_tmux_pane() {
+fn test_plan_manager_pane_defaults_to_codex_tmux_pane() {
     let tmp = TempDir::new().unwrap();
 
     let pane = plan_manager_pane(tmp.path(), &AutopilotConfig::default());
@@ -16,17 +16,14 @@ fn test_plan_manager_pane_defaults_to_claude_tmux_pane() {
     assert_eq!(pane.agent_id, "manager");
     assert_eq!(pane.role_id, "manager");
     assert_eq!(pane.session_role, TerminalSessionRole::Manager);
-    assert_eq!(pane.model_provider, ModelProvider::Claude);
+    assert_eq!(pane.model_provider, ModelProvider::Codex);
     assert_eq!(pane.terminal_kind, TerminalKind::Tmux);
     assert_eq!(pane.pane_label, "manager");
-    assert_eq!(pane.command, "claude --dangerously-skip-permissions");
-    assert_eq!(pane.provider_tool.program, "claude");
-    assert_eq!(
-        pane.provider_tool.args,
-        vec!["--dangerously-skip-permissions".to_string()]
-    );
+    assert_eq!(pane.command, "codex --yolo");
+    assert_eq!(pane.provider_tool.program, "codex");
+    assert_eq!(pane.provider_tool.args, vec!["--yolo".to_string()]);
     assert_eq!(pane.working_dir, tmp.path().display().to_string());
-    assert_eq!(pane.inject_text, "/squad manager manager");
+    assert_eq!(pane.inject_text, "$squad manager manager");
     assert_eq!(pane.status, TerminalSessionStatus::Planned);
 }
 
@@ -44,6 +41,37 @@ fn test_plan_manager_pane_honors_role_override() {
     assert_eq!(pane.command, "opencode");
     assert_eq!(pane.provider_tool.program, "opencode");
     assert_eq!(pane.inject_text, "/squad manager manager");
+}
+
+#[test]
+fn test_adaptive_policy_blocks_broad_claude_role_override() {
+    let tmp = TempDir::new().unwrap();
+    let config = AutopilotConfig {
+        role_overrides: BTreeMap::from([
+            ("manager".to_string(), ModelProvider::Claude),
+            ("security_reviewer".to_string(), ModelProvider::Claude),
+            ("claude_coding_worker".to_string(), ModelProvider::Claude),
+        ]),
+        ..AutopilotConfig::default()
+    };
+    let roles = ["manager", "security_reviewer", "claude_coding_worker"]
+        .into_iter()
+        .map(|role_id| GeneratedTeamRole {
+            role_id: role_id.to_string(),
+            prompt_file: format!("generated/{role_id}"),
+        })
+        .collect::<Vec<_>>();
+
+    let sessions = plan_terminal_sessions(tmp.path(), &roles, &config).unwrap();
+
+    assert_eq!(sessions[0].model_provider, ModelProvider::Codex);
+    assert_eq!(sessions[0].inject_text, "$squad manager manager");
+    assert_eq!(sessions[1].model_provider, ModelProvider::Codex);
+    assert_eq!(sessions[2].model_provider, ModelProvider::Claude);
+    assert_eq!(
+        sessions[2].inject_text,
+        "/squad claude_coding_worker claude_coding_worker"
+    );
 }
 
 #[test]
@@ -158,12 +186,12 @@ fn test_plan_terminal_sessions_uses_role_overrides_and_provider_commands() {
     assert_eq!(sessions[0].agent_id, "manager");
     assert_eq!(sessions[0].role_id, "manager");
     assert_eq!(sessions[0].session_role, TerminalSessionRole::Manager);
-    assert_eq!(sessions[0].model_provider, ModelProvider::Claude);
+    assert_eq!(sessions[0].model_provider, ModelProvider::Codex);
     assert_eq!(sessions[0].terminal_kind, TerminalKind::Tmux);
     assert_eq!(sessions[0].pane_label, "manager");
-    assert_eq!(sessions[0].command, "claude --dangerously-skip-permissions");
-    assert_eq!(sessions[0].provider_tool.program, "claude");
-    assert_eq!(sessions[0].inject_text, "/squad manager manager");
+    assert_eq!(sessions[0].command, "codex --yolo");
+    assert_eq!(sessions[0].provider_tool.program, "codex");
+    assert_eq!(sessions[0].inject_text, "$squad manager manager");
     assert_eq!(sessions[0].status, TerminalSessionStatus::Planned);
     assert_eq!(sessions[0].working_dir, tmp.path().display().to_string());
 
@@ -176,10 +204,10 @@ fn test_plan_terminal_sessions_uses_role_overrides_and_provider_commands() {
     assert_eq!(sessions[2].agent_id, "inspector");
     assert_eq!(sessions[2].role_id, "inspector");
     assert_eq!(sessions[2].session_role, TerminalSessionRole::Inspector);
-    assert_eq!(sessions[2].model_provider, ModelProvider::Claude);
-    assert_eq!(sessions[2].command, "claude --dangerously-skip-permissions");
-    assert_eq!(sessions[2].provider_tool.program, "claude");
-    assert_eq!(sessions[2].inject_text, "/squad inspector inspector");
+    assert_eq!(sessions[2].model_provider, ModelProvider::Codex);
+    assert_eq!(sessions[2].command, "codex --yolo");
+    assert_eq!(sessions[2].provider_tool.program, "codex");
+    assert_eq!(sessions[2].inject_text, "$squad inspector inspector");
 
     assert_eq!(sessions[3].model_provider, ModelProvider::Gemini);
     assert_eq!(sessions[3].session_role, TerminalSessionRole::Worker);
@@ -214,9 +242,9 @@ fn test_render_tmux_spawn_commands_covers_manager_and_generated_workers() {
     assert_eq!(commands.len(), 4);
     assert!(commands[0].contains("tmux new-window"));
     assert!(commands[0].contains("-n 'manager'"));
-    assert!(commands[0].contains("'claude --dangerously-skip-permissions'"));
+    assert!(commands[0].contains("'codex --yolo'"));
     assert!(commands[1].contains("tmux send-keys"));
-    assert!(commands[1].contains("'/squad manager manager'"));
+    assert!(commands[1].contains("'$squad manager manager'"));
     assert!(commands[2].contains("-n 'rust_backend'"));
     assert!(commands[2].contains("'codex --yolo'"));
     assert!(commands[3].contains("'$squad rust_backend rust_backend'"));
@@ -249,9 +277,9 @@ fn test_render_macos_terminal_commands_opens_physical_terminal_windows() {
     assert!(commands[0].contains("tell application"));
     assert!(commands[0].contains("Terminal"));
     assert!(commands[0].contains("autopilot - manager"));
-    assert!(commands[0].contains("claude --dangerously-skip-permissions"));
-    assert!(commands[0].contains("delay 8"));
-    assert!(commands[0].contains("/squad manager manager"));
+    assert!(commands[0].contains("codex --yolo"));
+    assert!(commands[0].contains("delay 45"));
+    assert!(commands[0].contains("$squad manager manager"));
     assert!(commands[0].contains("do script \"\" in autopilotTab"));
     assert!(commands[0].contains("key code 36"));
     assert!(commands[1].contains("autopilot - rust_backend"));
@@ -270,11 +298,14 @@ fn test_render_macos_terminal_commands_opens_physical_terminal_windows() {
 fn test_terminal_session_plan_serializes_status_and_terminal_kind() {
     let tmp = TempDir::new().unwrap();
     let roles = vec![GeneratedTeamRole {
-        role_id: "security_reviewer".to_string(),
-        prompt_file: "generated/security_reviewer".to_string(),
+        role_id: "claude_coding_worker".to_string(),
+        prompt_file: "generated/claude_coding_worker".to_string(),
     }];
     let config = AutopilotConfig {
-        role_overrides: BTreeMap::from([("security_reviewer".to_string(), ModelProvider::Claude)]),
+        role_overrides: BTreeMap::from([(
+            "claude_coding_worker".to_string(),
+            ModelProvider::Claude,
+        )]),
         ..AutopilotConfig::default()
     };
 
@@ -350,10 +381,10 @@ fn test_plan_terminal_sessions_rejects_empty_role_list() {
 }
 
 #[test]
-fn test_fresh_default_config_yields_claude_codex_only_mix() {
-    // The shipped default mix is Claude/Codex only (50/50); OpenRouter, Gemini,
-    // and local providers are all disabled, so a fresh config never schedules
-    // them for the standard science-swarm roster.
+fn test_fresh_default_config_yields_codex_managed_team() {
+    // Fresh config keeps broad roles on Codex. Claude is available only through
+    // the explicit small coding worker role, so science-swarm planning/review
+    // sessions do not bottleneck on Claude startup or long prompts.
     let tmp = TempDir::new().unwrap();
     init_autopilot_workspace(tmp.path()).unwrap();
     let config = load_config(tmp.path()).unwrap();
@@ -402,8 +433,8 @@ fn test_fresh_default_config_yields_claude_codex_only_mix() {
     assert_eq!(count(ModelProvider::OpenRouterFree), 0);
     assert_eq!(count(ModelProvider::OpenRouterCheap), 0);
     assert_eq!(count(ModelProvider::Local), 0);
-    assert_eq!(count(ModelProvider::Claude), 8);
-    assert_eq!(count(ModelProvider::Codex), 4);
+    assert_eq!(count(ModelProvider::Claude), 0);
+    assert_eq!(count(ModelProvider::Codex), 12);
 }
 
 #[test]

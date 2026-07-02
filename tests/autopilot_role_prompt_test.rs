@@ -112,11 +112,13 @@ fn test_synthesize_role_specs_from_prd_uses_smallest_specialized_team() {
             "test_engineer",
             "security_reviewer",
             "docs",
+            "claude_coding_worker",
         ]
     );
-    assert_eq!(specs[0].model_provider, ModelProvider::Claude);
+    assert_eq!(specs[0].model_provider, ModelProvider::Codex);
     assert_eq!(specs[2].model_provider, ModelProvider::Codex);
-    assert_eq!(specs[7].model_provider, ModelProvider::Gemini);
+    assert_eq!(specs[7].model_provider, ModelProvider::Codex);
+    assert_eq!(specs[8].model_provider, ModelProvider::Claude);
 }
 
 #[test]
@@ -180,17 +182,18 @@ fn test_apply_model_policy_to_role_specs_uses_mix_and_role_overrides() {
             local: 1.0,
         },
         role_overrides: BTreeMap::from([("docs".to_string(), ModelProvider::Gemini)]),
+        ..AutopilotConfig::default()
     };
 
     let planned = apply_model_policy_to_role_specs(&specs, &config);
 
-    assert_eq!(planned[0].model_provider, ModelProvider::Claude);
+    assert_eq!(planned[0].model_provider, ModelProvider::Codex);
     assert_eq!(planned[1].model_provider, ModelProvider::Local);
     assert_eq!(planned[2].model_provider, ModelProvider::Gemini);
 }
 
 #[test]
-fn test_apply_model_policy_splits_generated_roles_evenly_for_claude_codex_mix() {
+fn test_apply_model_policy_keeps_claude_to_small_coding_role() {
     let context = PrdRoleContext {
         product_goal: "Design and implement a Rust CLI autopilot workflow.".to_string(),
         implementation_tasks: vec![
@@ -220,29 +223,32 @@ fn test_apply_model_policy_splits_generated_roles_evenly_for_claude_codex_mix() 
         role_overrides: BTreeMap::from([
             ("manager".to_string(), ModelProvider::Claude),
             ("inspector".to_string(), ModelProvider::Codex),
+            ("claude_coding_worker".to_string(), ModelProvider::Claude),
         ]),
+        ..AutopilotConfig::default()
     };
 
     let planned = apply_model_policy_to_role_specs(&specs, &config);
 
-    assert_eq!(planned.len(), 10);
+    assert_eq!(planned.len(), 11);
     assert_eq!(
         planned
             .iter()
             .filter(|spec| spec.model_provider == ModelProvider::Claude)
             .count(),
-        5
+        1
     );
     assert_eq!(
         planned
             .iter()
-            .filter(|spec| spec.model_provider == ModelProvider::Codex)
-            .count(),
-        5
+            .find(|spec| spec.model_provider == ModelProvider::Claude)
+            .map(|spec| spec.role_id.as_str()),
+        Some("claude_coding_worker")
     );
-    assert!(planned.iter().all(|spec| {
-        spec.model_provider == ModelProvider::Claude || spec.model_provider == ModelProvider::Codex
-    }));
+    assert!(planned
+        .iter()
+        .all(|spec| spec.model_provider == ModelProvider::Claude
+            || spec.model_provider == ModelProvider::Codex));
 }
 
 #[test]
@@ -277,6 +283,7 @@ fn test_synthesize_role_specs_from_prd_covers_full_delivery_team_categories() {
     assert!(role_ids.contains(&"docs"));
     assert!(role_ids.contains(&"release_engineer"));
     assert!(role_ids.contains(&"security_reviewer"));
+    assert!(role_ids.contains(&"claude_coding_worker"));
 }
 
 #[test]

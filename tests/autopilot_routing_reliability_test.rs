@@ -8,21 +8,21 @@
 use squad::autopilot::RiskLevel;
 use squad::autopilot::{
     all_provider_adapter_overviews, available_providers, background_evidence_search_task_template,
-    check_provider_availability, classify_task_difficulty_local, continuous_integrity_check,
-    cost_latency_path, cost_latency_report_lines, curate_memory, dataset_discovery_task_template,
-    detect_duplicate_work, enforce_caps, estimate_cost_and_rate_limit, estimate_task_difficulty,
-    extract_acceptance_criteria, independent_verification_task_template, next_retry_delay_seconds,
-    plan_failed_task_requeue, provider_adapter_overview, provider_adapters_report_path,
-    provider_tier, read_cost_latency, read_verification_results, recommend_provider_tier,
-    record_cost_latency, record_verification_result, retry_backoff_delays_seconds,
-    tool_availability_scan_task_template, trace_summary_report_lines,
-    verification_result_report_lines, verification_results_path, verify_controls,
-    verify_statistics_plan, watchdog_plan, write_provider_adapters_report, CostLatencyRecord,
-    CostRateLimitEstimate, CostTier, CuratedMemoryItem, DifficultyBand, DifficultyEstimate,
-    DuplicateWorkHit, IntegrityFinding, IntegritySeverity, LocalDifficultyClassification,
-    ModelProvider, ProviderTier, RequeueOutcome, RoundTimeCaps, TaskGraph, TaskGraphStatus,
-    TaskGraphTask, VerificationResultRecord, VerificationVerdict, WatchdogAction,
-    WatchdogActionKind, WorkerHeartbeat,
+    check_provider_availability, classify_task_difficulty_local, claude_task_eligibility,
+    codex_backfill_plan, continuous_integrity_check, cost_latency_path, cost_latency_report_lines,
+    curate_memory, dataset_discovery_task_template, detect_duplicate_work, enforce_caps,
+    estimate_cost_and_rate_limit, estimate_task_difficulty, extract_acceptance_criteria,
+    independent_verification_task_template, next_retry_delay_seconds, plan_failed_task_requeue,
+    provider_adapter_overview, provider_adapters_report_path, provider_tier, read_cost_latency,
+    read_verification_results, recommend_provider_tier, record_cost_latency,
+    record_verification_result, retry_backoff_delays_seconds, tool_availability_scan_task_template,
+    trace_summary_report_lines, verification_result_report_lines, verification_results_path,
+    verify_controls, verify_statistics_plan, watchdog_plan, write_provider_adapters_report,
+    AdaptiveSchedulingConfig, AutopilotConfig, CostLatencyRecord, CostRateLimitEstimate, CostTier,
+    CuratedMemoryItem, DifficultyBand, DifficultyEstimate, DuplicateWorkHit, IntegrityFinding,
+    IntegritySeverity, LocalDifficultyClassification, ModelProvider, ProviderTier, RequeueOutcome,
+    RoundTimeCaps, TaskGraph, TaskGraphStatus, TaskGraphTask, VerificationResultRecord,
+    VerificationVerdict, WatchdogAction, WatchdogActionKind, WorkerHeartbeat,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -207,6 +207,84 @@ fn test_recommend_provider_tier_escalates_with_difficulty() {
         recommend_provider_tier(DifficultyBand::High),
         ProviderTier::Frontier
     );
+}
+
+#[test]
+fn test_claude_is_eligible_only_for_small_coding_tasks() {
+    let policy = AdaptiveSchedulingConfig::default();
+    let mut small = task(
+        "task-1",
+        "Implement parser guard",
+        "change one Rust function and add a focused unit test",
+    );
+    small.assigned_role = Some("claude_coding_worker".to_string());
+    small.likely_files = vec![
+        "src/autopilot.rs".to_string(),
+        "tests/autopilot.rs".to_string(),
+    ];
+    small.acceptance_criteria = vec!["invalid input is rejected".to_string()];
+    small.risk_level = RiskLevel::Low;
+
+    let eligibility = claude_task_eligibility(&small, &policy);
+    assert!(eligibility.eligible, "{:?}", eligibility.reasons);
+
+    let mut broad = task(
+        "task-2",
+        "Review architecture and summarize PRD",
+        "read the whole PRD, review the architecture, and produce a synthesis report",
+    );
+    broad.assigned_role = Some("architect".to_string());
+    broad.likely_files = vec![
+        "src/a.rs".to_string(),
+        "src/b.rs".to_string(),
+        "src/c.rs".to_string(),
+        "src/d.rs".to_string(),
+    ];
+    broad.acceptance_criteria = vec![
+        "criterion 1".to_string(),
+        "criterion 2".to_string(),
+        "criterion 3".to_string(),
+        "criterion 4".to_string(),
+    ];
+
+    let eligibility = claude_task_eligibility(&broad, &policy);
+    assert!(!eligibility.eligible);
+    assert!(eligibility
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("not a coding task")));
+}
+
+#[test]
+fn test_codex_backfills_ready_work_when_claude_is_stalled() {
+    let config = AutopilotConfig::default();
+    let tasks = vec![
+        task("task-1", "Implement API route", "coding work"),
+        task("task-2", "Implement store migration", "coding work"),
+        task("task-3", "Write docs summary", "documentation work"),
+    ];
+    let heartbeats = vec![
+        WorkerHeartbeat {
+            agent_id: "claude_coding_worker".to_string(),
+            last_seen_seconds_ago: config.adaptive_scheduling.claude_stall_seconds,
+            assigned_task_id: Some("task-99".to_string()),
+        },
+        WorkerHeartbeat {
+            agent_id: "codex_worker".to_string(),
+            last_seen_seconds_ago: 2,
+            assigned_task_id: None,
+        },
+    ];
+
+    let assignments = codex_backfill_plan(&tasks, &heartbeats, &config);
+
+    assert_eq!(
+        assignments.len(),
+        config.adaptive_scheduling.codex_backfill_batch_size
+    );
+    assert_eq!(assignments[0].provider, ModelProvider::Codex);
+    assert_eq!(assignments[0].task_id, "task-1");
+    assert!(assignments[0].reason.contains("Claude worker exceeded"));
 }
 
 // ============================================================================

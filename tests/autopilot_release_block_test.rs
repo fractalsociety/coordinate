@@ -5,12 +5,13 @@
 //! asserts the three release criteria:
 //!   1. `autopilot plan` reports EXACTLY 10 tasks (parser must not absorb
 //!      `## Completion Notes` or any other non-task section as tasks).
-//!   2. The shipped default model mix is Claude 50% / Codex 50% with everything
-//!      else at 0%.
-//!   3. `autopilot launch` plans EXACTLY 10 sessions: 5 Claude and 5 Codex.
+//!   2. The shipped default model mix is Codex-heavy (Claude 20% / Codex 80%)
+//!      with adaptive scheduling enabled and everything else at 0%.
+//!   3. `autopilot launch` does not assign broad manager/review/planning
+//!      sessions to Claude; Claude is only allowed for a small coding worker.
 //!
-//! The test MUST FAIL if the parser over-counts tasks or the default mix drifts
-//! away from the 50/50 Claude/Codex contract.
+//! The test MUST FAIL if the parser over-counts tasks or the adaptive
+//! Codex-managed contract drifts.
 
 use assert_cmd::Command;
 use tempfile::TempDir;
@@ -39,8 +40,14 @@ fn fresh_init_autopilot_pipeline_meets_release_block_criteria() {
 
     let config = std::fs::read_to_string(workspace.join(".squad").join("autopilot.toml")).unwrap();
     assert!(
-        config.contains("claude = 0.50") && config.contains("codex = 0.50"),
-        "shipped default mix must be Claude 50% / Codex 50%"
+        config.contains("claude = 0.20") && config.contains("codex = 0.80"),
+        "shipped default mix must be Claude 20% / Codex 80%"
+    );
+    assert!(
+        config.contains("enabled = true")
+            && config.contains("claude_coding_only = true")
+            && config.contains("codex_backfill_when_waiting_on_claude = true"),
+        "adaptive scheduling must be enabled by default: {config}"
     );
     assert!(
         config.contains("gemini = 0.00")
@@ -64,7 +71,9 @@ fn fresh_init_autopilot_pipeline_meets_release_block_criteria() {
         "plan must report exactly 10 tasks; got: {plan}"
     );
 
-    // STEP 2 guard: run synthesizes exactly 10 agents / 10 sessions.
+    // STEP 2 guard: run synthesizes a Codex-managed team. The generated team
+    // may include an extra small Claude coding worker, but broad roles stay on
+    // Codex.
     let run = squad(workspace)
         .args(["autopilot", "run", &amc_prd_path()])
         .assert()
@@ -74,11 +83,11 @@ fn fresh_init_autopilot_pipeline_meets_release_block_criteria() {
         .clone();
     let run = String::from_utf8_lossy(&run);
     assert!(
-        run.contains("Agents: 10") && run.contains("Sessions planned: 10"),
-        "run must synthesize 10 agents and 10 sessions; got: {run}"
+        run.contains("Agents: 11") && run.contains("Sessions planned: 11"),
+        "run must synthesize 11 agents and 11 sessions with the small Claude coding worker; got: {run}"
     );
 
-    // STEP 2 guard: launch plans exactly 10 sessions split 5 Claude / 5 Codex.
+    // STEP 2 guard: launch plans one Claude session and the rest Codex.
     let launch = squad(workspace)
         .args(["autopilot", "launch", "--run-id", "1"])
         .assert()
@@ -88,17 +97,19 @@ fn fresh_init_autopilot_pipeline_meets_release_block_criteria() {
         .clone();
     let launch = String::from_utf8_lossy(&launch);
     assert!(
-        launch.contains("Sessions: 10"),
-        "launch must plan 10 sessions; got: {launch}"
+        launch.contains("Sessions: 11"),
+        "launch must plan 11 sessions; got: {launch}"
     );
     let claude_sessions = launch.matches("claude ->").count();
     let codex_sessions = launch.matches("codex ->").count();
     assert_eq!(
-        claude_sessions, 5,
-        "expected 5 Claude sessions; got {claude_sessions}\n{launch}"
+        claude_sessions, 1,
+        "expected 1 Claude small-coding session; got {claude_sessions}\n{launch}"
     );
     assert_eq!(
-        codex_sessions, 5,
-        "expected 5 Codex sessions; got {codex_sessions}\n{launch}"
+        codex_sessions, 10,
+        "expected 10 Codex sessions; got {codex_sessions}\n{launch}"
     );
+    assert!(launch.contains("claude_coding_worker"));
+    assert!(!launch.contains("manager [manager] claude"));
 }

@@ -2,12 +2,13 @@ use squad::autopilot::{
     failures_retries_path, failures_retries_report_lines, files_changed_path, final_report_path,
     init_autopilot_workspace, load_config, read_failures_retries, read_files_changed,
     record_failure_retry, record_files_changed, render_final_report, write_final_report,
-    AutopilotConfig, FailureRetryRecord, FinalReport, ModelMix, ModelProvider,
+    AdaptiveSchedulingConfig, AutopilotConfig, FailureRetryRecord, FinalReport, ModelMix,
+    ModelProvider,
 };
 use tempfile::TempDir;
 
 #[test]
-fn test_default_autopilot_config_uses_claude_codex_50_50_mix() {
+fn test_default_autopilot_config_uses_codex_heavy_adaptive_mix() {
     let tmp = TempDir::new().unwrap();
     init_autopilot_workspace(tmp.path()).unwrap();
     let config = load_config(tmp.path()).unwrap();
@@ -15,22 +16,30 @@ fn test_default_autopilot_config_uses_claude_codex_50_50_mix() {
     assert_eq!(
         config.model_mix,
         ModelMix {
-            claude: 0.50,
-            codex: 0.50,
+            claude: 0.20,
+            codex: 0.80,
             gemini: 0.00,
             openrouter_free: 0.00,
             openrouter_cheap: 0.00,
             local: 0.00,
         }
     );
+    assert_eq!(
+        config.adaptive_scheduling,
+        AdaptiveSchedulingConfig::default()
+    );
 
     assert_eq!(
         config.role_overrides.get("literature_worker"),
-        Some(&ModelProvider::Claude)
+        Some(&ModelProvider::Codex)
     );
     assert_eq!(
         config.role_overrides.get("test_worker"),
         Some(&ModelProvider::Codex)
+    );
+    assert_eq!(
+        config.role_overrides.get("claude_coding_worker"),
+        Some(&ModelProvider::Claude)
     );
     assert_eq!(
         config.role_overrides.get("trace_collector"),

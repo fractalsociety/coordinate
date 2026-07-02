@@ -189,13 +189,16 @@ fn test_autopilot_init_creates_config_and_directories() {
 
     let config = std::fs::read_to_string(tmp.path().join(".squad").join("autopilot.toml")).unwrap();
     assert!(config.contains("[role_overrides]"));
-    assert!(config.contains("manager = \"claude\""));
-    assert!(config.contains("scientific_planner = \"claude\""));
-    assert!(config.contains("literature_worker = \"claude\""));
+    assert!(config.contains("manager = \"codex\""));
+    assert!(config.contains("scientific_planner = \"codex\""));
+    assert!(config.contains("literature_worker = \"codex\""));
+    assert!(config.contains("claude_coding_worker = \"claude\""));
     assert!(config.contains("test_worker = \"codex\""));
     assert!(config.contains("trace_collector = \"codex\""));
-    assert!(config.contains("claude = 0.50"));
-    assert!(config.contains("codex = 0.50"));
+    assert!(config.contains("claude = 0.20"));
+    assert!(config.contains("codex = 0.80"));
+    assert!(config.contains("claude_coding_only = true"));
+    assert!(config.contains("codex_backfill_when_waiting_on_claude = true"));
     assert!(config.contains("gemini = 0.00"));
     assert!(config.contains("openrouter_free = 0.00"));
     assert!(config.contains("local = 0.00"));
@@ -285,7 +288,7 @@ fn test_autopilot_launch_prints_terminal_session_plan_for_run() {
                 AutopilotAgentInput {
                     name: "Autopilot Manager".to_string(),
                     role: "manager".to_string(),
-                    model_provider: "claude".to_string(),
+                    model_provider: "codex".to_string(),
                     skills_prompt: "Coordinate work.".to_string(),
                 },
                 AutopilotAgentInput {
@@ -324,19 +327,19 @@ fn test_autopilot_launch_prints_terminal_session_plan_for_run() {
             }
         )))
         .stdout(predicate::str::contains(
-            "- manager-r1 [manager] claude -> claude --dangerously-skip-permissions",
+            "- manager-r1 [manager] codex -> codex --yolo",
         ))
         .stdout(predicate::str::contains(
-            "- inspector-r1 [inspector] claude -> claude --dangerously-skip-permissions",
+            "- inspector-r1 [inspector] codex -> codex --yolo",
         ))
         .stdout(predicate::str::contains(
             "- rust_backend-r1 [worker] codex -> codex --yolo",
         ))
         .stdout(predicate::str::contains(
-            "inject: /squad manager manager-r1",
+            "inject: $squad manager manager-r1",
         ))
         .stdout(predicate::str::contains(
-            "inject: /squad inspector inspector-r1",
+            "inject: $squad inspector inspector-r1",
         ))
         .stdout(predicate::str::contains(
             "inject: $squad rust_backend rust_backend-r1",
@@ -344,10 +347,7 @@ fn test_autopilot_launch_prints_terminal_session_plan_for_run() {
 
     let persisted_sessions = store.list_autopilot_terminal_sessions(run.id).unwrap();
     assert_eq!(persisted_sessions.len(), 3);
-    assert_eq!(
-        persisted_sessions[0].command,
-        "claude --dangerously-skip-permissions"
-    );
+    assert_eq!(persisted_sessions[0].command, "codex --yolo");
     assert_eq!(persisted_sessions[2].command, "codex --yolo");
 }
 
@@ -377,7 +377,7 @@ fn test_autopilot_launch_execute_runs_tmux_commands() {
         )
         .unwrap();
     store
-        .register_agent_with_metadata("manager", "manager", Some("claude"), Some(2))
+        .register_agent_with_metadata("manager", "manager", Some("codex"), Some(2))
         .unwrap();
     store
         .register_agent_with_metadata("rust_backend", "rust_backend", Some("codex"), Some(2))
@@ -414,8 +414,8 @@ fn test_autopilot_launch_execute_runs_tmux_commands() {
     let log = std::fs::read_to_string(tmux_log).unwrap();
     assert!(log.contains("has-session -t test-autopilot"));
     assert!(log.contains("new-session -d -s test-autopilot -n manager-r1"));
-    assert!(log.contains("claude --dangerously-skip-permissions"));
-    assert!(log.contains("send-keys -t test-autopilot:manager-r1 /squad manager manager-r1 C-m"));
+    assert!(log.contains("codex --yolo"));
+    assert!(log.contains("send-keys -t test-autopilot:manager-r1 $squad manager manager-r1 C-m"));
     assert!(log.contains("new-window -t test-autopilot -n rust_backend-r1"));
     assert!(log.contains("codex --yolo"));
     assert!(log.contains(
@@ -436,7 +436,7 @@ fn test_autopilot_launch_execute_runs_macos_terminal_commands() {
                 AutopilotAgentInput {
                     name: "Autopilot Manager".to_string(),
                     role: "manager".to_string(),
-                    model_provider: "claude".to_string(),
+                    model_provider: "codex".to_string(),
                     skills_prompt: "Coordinate work.".to_string(),
                 },
                 AutopilotAgentInput {
@@ -449,7 +449,7 @@ fn test_autopilot_launch_execute_runs_macos_terminal_commands() {
         )
         .unwrap();
     store
-        .register_agent_with_metadata("manager", "manager", Some("claude"), Some(2))
+        .register_agent_with_metadata("manager", "manager", Some("codex"), Some(2))
         .unwrap();
     store
         .register_agent_with_metadata("rust_backend", "rust_backend", Some("codex"), Some(2))
@@ -488,8 +488,8 @@ fn test_autopilot_launch_execute_runs_macos_terminal_commands() {
     let log = std::fs::read_to_string(osascript_log).unwrap();
     assert!(log.contains("tell application \"Terminal\""));
     assert!(log.contains("test-autopilot - manager"));
-    assert!(log.contains("claude --dangerously-skip-permissions"));
-    assert!(log.contains("/squad manager manager"));
+    assert!(log.contains("codex --yolo"));
+    assert!(log.contains("$squad manager manager"));
     assert!(log.contains("test-autopilot - rust_backend"));
     assert!(log.contains("codex --yolo"));
     assert!(log.contains("$squad rust_backend rust_backend"));
@@ -678,10 +678,10 @@ Test Requirements
     assert!(final_report.contains("task-1 [SEQUENTIAL] Add schema persistence"));
     assert!(final_report.contains("task-2 [READY_PARALLEL] Add CLI docs"));
     assert!(final_report.contains("## Agents Used"));
-    assert!(final_report.contains("manager: Autopilot Manager (claude)"));
+    assert!(final_report.contains("manager: Autopilot Manager (codex)"));
     assert!(final_report.contains("## Model Mix Used"));
-    assert!(final_report.contains("claude 50%"));
-    assert!(final_report.contains("codex 50%"));
+    assert!(final_report.contains("claude 20%"));
+    assert!(final_report.contains("codex 80%"));
     assert!(final_report.contains("gemini 0%"));
     assert!(final_report.contains("openrouter_free 0%"));
     assert!(final_report.contains("openrouter_cheap 0%"));

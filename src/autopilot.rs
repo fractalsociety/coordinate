@@ -77,6 +77,8 @@ pub struct AutopilotConfig {
     pub model_mix: ModelMix,
     #[serde(default)]
     pub role_overrides: BTreeMap<String, ModelProvider>,
+    #[serde(default)]
+    pub adaptive_scheduling: AdaptiveSchedulingConfig,
 }
 
 impl Default for AutopilotConfig {
@@ -84,6 +86,7 @@ impl Default for AutopilotConfig {
         Self {
             model_mix: ModelMix::default(),
             role_overrides: BTreeMap::new(),
+            adaptive_scheduling: AdaptiveSchedulingConfig::default(),
         }
     }
 }
@@ -96,6 +99,105 @@ impl AutopilotConfig {
     ) -> &'a ModelProvider {
         self.role_overrides.get(role).unwrap_or(default_provider)
     }
+}
+
+impl AdaptiveSchedulingConfig {
+    fn validate(&self) -> Result<()> {
+        if self.claude_max_difficulty_score > 100 {
+            bail!("adaptive_scheduling.claude_max_difficulty_score must be <= 100");
+        }
+        if self.claude_max_description_chars == 0 {
+            bail!("adaptive_scheduling.claude_max_description_chars must be positive");
+        }
+        if self.claude_slowdown_factor == 0 {
+            bail!("adaptive_scheduling.claude_slowdown_factor must be positive");
+        }
+        if self.codex_backfill_batch_size == 0 {
+            bail!("adaptive_scheduling.codex_backfill_batch_size must be positive");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptiveSchedulingConfig {
+    #[serde(default = "default_adaptive_scheduling_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_claude_coding_only")]
+    pub claude_coding_only: bool,
+    #[serde(default = "default_claude_max_difficulty_score")]
+    pub claude_max_difficulty_score: u32,
+    #[serde(default = "default_claude_max_description_chars")]
+    pub claude_max_description_chars: usize,
+    #[serde(default = "default_claude_max_acceptance_criteria")]
+    pub claude_max_acceptance_criteria: usize,
+    #[serde(default = "default_claude_max_likely_files")]
+    pub claude_max_likely_files: usize,
+    #[serde(default = "default_claude_slowdown_factor")]
+    pub claude_slowdown_factor: u32,
+    #[serde(default = "default_claude_stall_seconds")]
+    pub claude_stall_seconds: u64,
+    #[serde(default = "default_codex_backfill_when_waiting_on_claude")]
+    pub codex_backfill_when_waiting_on_claude: bool,
+    #[serde(default = "default_codex_backfill_batch_size")]
+    pub codex_backfill_batch_size: usize,
+}
+
+impl Default for AdaptiveSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_adaptive_scheduling_enabled(),
+            claude_coding_only: default_claude_coding_only(),
+            claude_max_difficulty_score: default_claude_max_difficulty_score(),
+            claude_max_description_chars: default_claude_max_description_chars(),
+            claude_max_acceptance_criteria: default_claude_max_acceptance_criteria(),
+            claude_max_likely_files: default_claude_max_likely_files(),
+            claude_slowdown_factor: default_claude_slowdown_factor(),
+            claude_stall_seconds: default_claude_stall_seconds(),
+            codex_backfill_when_waiting_on_claude: default_codex_backfill_when_waiting_on_claude(),
+            codex_backfill_batch_size: default_codex_backfill_batch_size(),
+        }
+    }
+}
+
+fn default_adaptive_scheduling_enabled() -> bool {
+    true
+}
+
+fn default_claude_coding_only() -> bool {
+    true
+}
+
+fn default_claude_max_difficulty_score() -> u32 {
+    45
+}
+
+fn default_claude_max_description_chars() -> usize {
+    900
+}
+
+fn default_claude_max_acceptance_criteria() -> usize {
+    3
+}
+
+fn default_claude_max_likely_files() -> usize {
+    3
+}
+
+fn default_claude_slowdown_factor() -> u32 {
+    5
+}
+
+fn default_claude_stall_seconds() -> u64 {
+    180
+}
+
+fn default_codex_backfill_when_waiting_on_claude() -> bool {
+    true
+}
+
+fn default_codex_backfill_batch_size() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,11 +230,11 @@ impl Default for ModelMix {
 }
 
 fn default_model_mix_claude() -> f64 {
-    0.50
+    0.20
 }
 
 fn default_model_mix_codex() -> f64 {
-    0.50
+    0.80
 }
 
 fn default_model_mix_openrouter_free() -> f64 {
@@ -249,36 +351,49 @@ pub struct AutopilotInitResult {
 
 fn default_autopilot_config_content() -> &'static str {
     r#"[model_mix]
-claude = 0.50
-codex = 0.50
+claude = 0.20
+codex = 0.80
 gemini = 0.00
 openrouter_free = 0.00
 openrouter_cheap = 0.00
 local = 0.00
 
+[adaptive_scheduling]
+enabled = true
+claude_coding_only = true
+claude_max_difficulty_score = 45
+claude_max_description_chars = 900
+claude_max_acceptance_criteria = 3
+claude_max_likely_files = 3
+claude_slowdown_factor = 5
+claude_stall_seconds = 180
+codex_backfill_when_waiting_on_claude = true
+codex_backfill_batch_size = 2
+
 [role_overrides]
-manager = "claude"
-scientific_planner = "claude"
-protocol_designer = "claude"
-literature_worker = "claude"
-hypothesis_worker = "claude"
+manager = "codex"
+scientific_planner = "codex"
+protocol_designer = "codex"
+literature_worker = "codex"
+hypothesis_worker = "codex"
 tool_mapper = "codex"
 coding_worker = "codex"
+claude_coding_worker = "claude"
 verification_worker = "codex"
-adversarial_critic = "claude"
-safety_gatekeeper = "claude"
+adversarial_critic = "codex"
+safety_gatekeeper = "codex"
 trace_collector = "codex"
 router = "codex"
 compressor = "codex"
-inspector = "claude"
-architect = "claude"
+inspector = "codex"
+architect = "codex"
 rust_backend = "codex"
 sqlite_engineer = "codex"
 terminal_tmux = "codex"
 test_engineer = "codex"
 test_worker = "codex"
-security_reviewer = "claude"
-docs = "claude"
+security_reviewer = "codex"
+docs = "codex"
 release_engineer = "codex"
 "#
 }
@@ -295,6 +410,10 @@ pub fn load_config(workspace: &Path) -> Result<AutopilotConfig> {
         .with_context(|| format!("failed to parse autopilot config: {}", path.display()))?;
     config
         .model_mix
+        .validate()
+        .with_context(|| format!("failed to validate autopilot config: {}", path.display()))?;
+    config
+        .adaptive_scheduling
         .validate()
         .with_context(|| format!("failed to validate autopilot config: {}", path.display()))?;
     Ok(config)
@@ -1019,27 +1138,21 @@ fn derive_spawn_plan(tasks: &[TaskGraphTask]) -> SpawnPlan {
         .filter(|task| task.status == TaskGraphStatus::ReadyParallel)
         .count()
         .clamp(1, 40);
+    let claude_workers = tasks
+        .iter()
+        .filter(|task| task.status == TaskGraphStatus::ReadyParallel)
+        .filter(|task| claude_task_eligibility(task, &AdaptiveSchedulingConfig::default()).eligible)
+        .count()
+        .min(((max_workers as f64) * 0.20).ceil() as usize);
     let mut providers = BTreeMap::new();
-    providers.insert(
-        "claude".to_string(),
-        ((max_workers as f64) * 0.15).ceil() as usize,
-    );
+    providers.insert("claude".to_string(), claude_workers);
     providers.insert(
         "codex".to_string(),
-        ((max_workers as f64) * 0.15).ceil() as usize,
+        max_workers.saturating_sub(claude_workers),
     );
-    providers.insert(
-        "openrouter_free".to_string(),
-        ((max_workers as f64) * 0.50).ceil() as usize,
-    );
-    providers.insert(
-        "openrouter_cheap".to_string(),
-        ((max_workers as f64) * 0.10).ceil() as usize,
-    );
-    providers.insert(
-        "local".to_string(),
-        ((max_workers as f64) * 0.10).ceil() as usize,
-    );
+    providers.insert("openrouter_free".to_string(), 0);
+    providers.insert("openrouter_cheap".to_string(), 0);
+    providers.insert("local".to_string(), 0);
     SpawnPlan {
         max_workers,
         providers,
@@ -1115,7 +1228,7 @@ pub fn synthesize_role_specs_from_prd(context: &PrdRoleContext) -> Vec<RolePromp
         role_prompt_spec(
             "manager",
             "Autopilot Manager",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Own PRD execution, task assignment, dependency sequencing, and final acceptance.",
             vec!["."],
             vec![],
@@ -1130,7 +1243,7 @@ pub fn synthesize_role_specs_from_prd(context: &PrdRoleContext) -> Vec<RolePromp
         role_prompt_spec(
             "inspector",
             "Inspector",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Review completed work for correctness, regressions, test coverage, and PRD fit.",
             vec!["."],
             vec![],
@@ -1151,7 +1264,7 @@ pub fn synthesize_role_specs_from_prd(context: &PrdRoleContext) -> Vec<RolePromp
         specs.push(role_prompt_spec(
             "architect",
             "Product Architect",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Translate product goals into technical structure, sequencing, and cross-role boundaries.",
             vec!["."],
             vec![],
@@ -1261,7 +1374,7 @@ pub fn synthesize_role_specs_from_prd(context: &PrdRoleContext) -> Vec<RolePromp
         specs.push(role_prompt_spec(
             "security_reviewer",
             "Security Reviewer",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Review risky areas, security-sensitive behavior, and unsafe execution paths.",
             vec!["."],
             vec![],
@@ -1278,7 +1391,7 @@ pub fn synthesize_role_specs_from_prd(context: &PrdRoleContext) -> Vec<RolePromp
         specs.push(role_prompt_spec(
             "docs",
             "Docs Engineer",
-            ModelProvider::Gemini,
+            ModelProvider::Codex,
             "Update user-facing docs and PRD/final-report language accurately.",
             vec!["README.md", "README.zh-CN.md", "docs/", ".squad/autopilot/"],
             vec![],
@@ -1328,6 +1441,38 @@ pub fn synthesize_role_specs_from_prd(context: &PrdRoleContext) -> Vec<RolePromp
         ensure_science_swarm_roles(&mut specs);
     }
 
+    if role_context_matches(
+        &corpus,
+        &[
+            "code",
+            "coding",
+            "implement",
+            "src/",
+            "tests/",
+            "schema",
+            "api",
+            "cli",
+        ],
+    ) && !specs
+        .iter()
+        .any(|spec| spec.role_id == "claude_coding_worker")
+    {
+        specs.push(role_prompt_spec(
+            "claude_coding_worker",
+            "Claude Small Coding Worker",
+            ModelProvider::Claude,
+            "Implement exactly one small coding task with a short prompt, narrow file scope, and focused tests. Do not take planning, research, review, docs, architecture, or multi-file design tasks.",
+            vec!["src/", "tests/"],
+            vec![
+                "Do not accept long planning or review tasks",
+                "Do not work across more than three likely files unless manager splits the task",
+            ],
+            vec!["Changed files", "Tests run", "Residual risk"],
+            vec!["One narrow coding task is completed with focused test evidence."],
+            vec!["Task has more than three files", "Prompt is too broad", "Acceptance criteria exceed three bullets"],
+        ));
+    }
+
     specs
 }
 
@@ -1336,7 +1481,7 @@ fn ensure_science_swarm_roles(specs: &mut Vec<RolePromptSpec>) {
         role_prompt_spec(
             "scientific_planner",
             "Scientific Planner",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Frame objectives as falsifiable scientific questions, hypotheses, refutation criteria, and risk classes before any worker execution.",
             vec![".squad/autopilot/", "docs/"],
             vec!["Do not execute scientific tools before protocol freeze"],
@@ -1347,7 +1492,7 @@ fn ensure_science_swarm_roles(specs: &mut Vec<RolePromptSpec>) {
         role_prompt_spec(
             "protocol_designer",
             "Protocol Designer",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Create frozen protocol artifacts with controls, endpoints, verification layers, and success/failure thresholds.",
             vec![".squad/autopilot/"],
             vec!["No clinical dosing, delivery, or human-use instructions"],
@@ -1413,7 +1558,7 @@ fn ensure_science_swarm_roles(specs: &mut Vec<RolePromptSpec>) {
         role_prompt_spec(
             "adversarial_critic",
             "Adversarial Critic",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Try to refute the build, identify confounders, downgrade weak claims, and block overconfident conclusions.",
             vec![".squad/autopilot/"],
             vec!["Do not produce the final claim being reviewed"],
@@ -1424,7 +1569,7 @@ fn ensure_science_swarm_roles(specs: &mut Vec<RolePromptSpec>) {
         role_prompt_spec(
             "safety_gatekeeper",
             "Safety Gatekeeper",
-            ModelProvider::Claude,
+            ModelProvider::Codex,
             "Enforce dual-use, predicted-vs-measured, no medical advice, and human checkpoint rules.",
             vec![".squad/autopilot/"],
             vec!["No dosing, delivery, clinical, or harmful operational instructions"],
@@ -1507,9 +1652,22 @@ pub fn apply_model_policy_to_role_specs(
         if let Some(provider) = config.role_overrides.get(spec.role_id.trim()) {
             spec.model_provider = provider.clone();
         }
+        if config.adaptive_scheduling.enabled
+            && spec.model_provider == ModelProvider::Claude
+            && !role_allows_claude_coding(spec.role_id.trim())
+        {
+            spec.model_provider = ModelProvider::Codex;
+        }
     }
 
     planned
+}
+
+fn role_allows_claude_coding(role_id: &str) -> bool {
+    let role_id = role_id.to_ascii_lowercase();
+    role_id == "claude_coding_worker"
+        || role_id.contains("claude_coding")
+        || role_id.contains("small_coding")
 }
 
 fn assign_model_mix(model_mix: &ModelMix, count: usize) -> Vec<ModelProvider> {
@@ -1607,6 +1765,13 @@ pub fn generate_role_prompt(context: &PrdRoleContext, spec: &RolePromptSpec) -> 
         &mut output,
         fallback(&spec.skills_prompt, "Execute assigned work for this PRD."),
     );
+    if spec.model_provider == ModelProvider::Claude {
+        push_heading(&mut output, "Claude Task Size Policy");
+        push_paragraph(
+            &mut output,
+            "Accept only one small coding task at a time. The task must have a narrow prompt, no more than three likely files, no more than three acceptance criteria, and a concrete test command. Decline planning, research, review, docs, architecture, and broad synthesis tasks so the manager can split or reassign them to Codex.",
+        );
+    }
 
     push_heading(&mut output, "PRD Context");
     push_field(
@@ -2466,10 +2631,7 @@ impl ProviderToolCommand {
 }
 
 pub fn plan_manager_pane(workspace: &Path, config: &AutopilotConfig) -> TerminalSessionPlan {
-    let default_provider = ModelProvider::Claude;
-    let provider = config
-        .provider_for_role("manager", &default_provider)
-        .clone();
+    let provider = provider_for_role_with_adaptive(config, "manager", &ModelProvider::Codex);
     terminal_session_plan_for_role(workspace, "manager", provider)
 }
 
@@ -2493,7 +2655,7 @@ pub fn plan_worker_panes(
     let mut sessions = Vec::with_capacity(worker_roles.len());
     for role in worker_roles {
         let role_id = normalized_role_id(&role.role_id)?;
-        let provider = config.provider_for_role(role_id, &default_provider).clone();
+        let provider = provider_for_role_with_adaptive(config, role_id, &default_provider);
         sessions.push(terminal_session_plan_for_role(workspace, role_id, provider));
     }
     Ok(sessions)
@@ -2515,12 +2677,28 @@ pub fn plan_terminal_sessions(
             sessions.push(plan_manager_pane(workspace, config));
         } else {
             let default_provider = ModelProvider::Codex;
-            let provider = config.provider_for_role(role_id, &default_provider).clone();
+            let provider = provider_for_role_with_adaptive(config, role_id, &default_provider);
             sessions.push(terminal_session_plan_for_role(workspace, role_id, provider));
         }
     }
 
     Ok(sessions)
+}
+
+fn provider_for_role_with_adaptive(
+    config: &AutopilotConfig,
+    role_id: &str,
+    default_provider: &ModelProvider,
+) -> ModelProvider {
+    let provider = config.provider_for_role(role_id, default_provider).clone();
+    if config.adaptive_scheduling.enabled
+        && provider == ModelProvider::Claude
+        && !role_allows_claude_coding(role_id)
+    {
+        ModelProvider::Codex
+    } else {
+        provider
+    }
 }
 
 pub fn render_tmux_spawn_commands(
@@ -3254,6 +3432,188 @@ pub fn recommend_provider_tier(band: DifficultyBand) -> ProviderTier {
         DifficultyBand::Medium => ProviderTier::Cheap,
         DifficultyBand::High => ProviderTier::Frontier,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeTaskEligibility {
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Decide whether a task is small and concrete enough for Claude under the
+/// current adaptive policy. This intentionally does not route research,
+/// planning, review, docs, or architecture work to Claude because those prompts
+/// tend to become long and slow; Claude is kept on narrow coding tasks.
+pub fn claude_task_eligibility(
+    task: &TaskGraphTask,
+    policy: &AdaptiveSchedulingConfig,
+) -> ClaudeTaskEligibility {
+    let mut reasons = Vec::new();
+    if !policy.enabled {
+        reasons.push("adaptive scheduling disabled".to_string());
+    }
+    if policy.claude_coding_only && !task_looks_like_coding(task) {
+        reasons.push("not a coding task".to_string());
+    }
+
+    let estimate = estimate_task_difficulty(task);
+    if estimate.score > policy.claude_max_difficulty_score {
+        reasons.push(format!(
+            "difficulty score {} exceeds claude max {}",
+            estimate.score, policy.claude_max_difficulty_score
+        ));
+    }
+    let text_len = task.title.len() + task.description.len();
+    if text_len > policy.claude_max_description_chars {
+        reasons.push(format!(
+            "task text length {text_len} exceeds claude max {}",
+            policy.claude_max_description_chars
+        ));
+    }
+    if task.acceptance_criteria.len() > policy.claude_max_acceptance_criteria {
+        reasons.push(format!(
+            "{} acceptance criteria exceeds claude max {}",
+            task.acceptance_criteria.len(),
+            policy.claude_max_acceptance_criteria
+        ));
+    }
+    if task.likely_files.len() > policy.claude_max_likely_files {
+        reasons.push(format!(
+            "{} likely files exceeds claude max {}",
+            task.likely_files.len(),
+            policy.claude_max_likely_files
+        ));
+    }
+    if task.risk_level == RiskLevel::High {
+        reasons.push("high risk task".to_string());
+    }
+    if task.status == TaskGraphStatus::ReviewRequired {
+        reasons.push("review-required task".to_string());
+    }
+
+    ClaudeTaskEligibility {
+        eligible: reasons.is_empty(),
+        reasons,
+    }
+}
+
+fn task_looks_like_coding(task: &TaskGraphTask) -> bool {
+    let text = format!(
+        "{}\n{}\n{}\n{}",
+        task.title,
+        task.description,
+        task.assigned_role.as_deref().unwrap_or_default(),
+        task.likely_files.join("\n")
+    )
+    .to_ascii_lowercase();
+    let coding_hits = [
+        "code",
+        "coding",
+        "implement",
+        "fix",
+        "src/",
+        "tests/",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".py",
+        "schema",
+        "api",
+        "cli",
+        "database",
+        "migration",
+        "router",
+        "worker",
+    ];
+    let non_coding_hits = [
+        "review",
+        "audit",
+        "docs",
+        "documentation",
+        "readme",
+        "architecture",
+        "architect",
+        "planning",
+        "research",
+        "literature",
+        "summarize",
+        "prd",
+    ];
+    coding_hits.iter().any(|keyword| text.contains(keyword))
+        && !non_coding_hits.iter().any(|keyword| text.contains(keyword))
+}
+
+/// Pick the provider for a task under adaptive scheduling. Codex is the default
+/// executor and backstop; Claude is selected only when the task is both coding
+/// work and small enough for the configured Claude limits.
+pub fn adaptive_provider_for_task(task: &TaskGraphTask, config: &AutopilotConfig) -> ModelProvider {
+    if !config.adaptive_scheduling.enabled {
+        return task
+            .assigned_role
+            .as_deref()
+            .map(|role| {
+                config
+                    .provider_for_role(role, &ModelProvider::Codex)
+                    .clone()
+            })
+            .unwrap_or(ModelProvider::Codex);
+    }
+    if claude_task_eligibility(task, &config.adaptive_scheduling).eligible {
+        ModelProvider::Claude
+    } else {
+        ModelProvider::Codex
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillAssignment {
+    pub task_id: String,
+    pub provider: ModelProvider,
+    pub reason: String,
+}
+
+/// Keep Codex productive while Claude is still working. If any Claude worker is
+/// holding work past the configured stall window, dispatch additional ready
+/// tasks to Codex up to the backfill batch size instead of waiting for Claude.
+pub fn codex_backfill_plan(
+    tasks: &[TaskGraphTask],
+    heartbeats: &[WorkerHeartbeat],
+    config: &AutopilotConfig,
+) -> Vec<BackfillAssignment> {
+    let policy = &config.adaptive_scheduling;
+    if !policy.enabled || !policy.codex_backfill_when_waiting_on_claude {
+        return Vec::new();
+    }
+
+    let waiting_on_claude = heartbeats.iter().any(|heartbeat| {
+        heartbeat.agent_id.to_ascii_lowercase().contains("claude")
+            && heartbeat.assigned_task_id.is_some()
+            && heartbeat.last_seen_seconds_ago >= policy.claude_stall_seconds
+    });
+    if !waiting_on_claude {
+        return Vec::new();
+    }
+
+    let assigned: std::collections::BTreeSet<&str> = heartbeats
+        .iter()
+        .filter_map(|heartbeat| heartbeat.assigned_task_id.as_deref())
+        .collect();
+
+    tasks
+        .iter()
+        .filter(|task| task.status == TaskGraphStatus::ReadyParallel)
+        .filter(|task| !assigned.contains(task.id.as_str()))
+        .take(policy.codex_backfill_batch_size)
+        .map(|task| BackfillAssignment {
+            task_id: task.id.clone(),
+            provider: ModelProvider::Codex,
+            reason: format!(
+                "Claude worker exceeded {}s; backfilling independent Codex work",
+                policy.claude_stall_seconds
+            ),
+        })
+        .collect()
 }
 
 // ---------- Provider availability & cost (tasks 37, 38) ----------

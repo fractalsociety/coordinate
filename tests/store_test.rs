@@ -226,7 +226,7 @@ fn test_create_autopilot_terminal_sessions_persists_planned_sessions() {
     assert_eq!(records[0].run_id, run.id);
     assert_eq!(records[0].agent_id, agents[0].id);
     assert_eq!(records[0].terminal_kind, "tmux");
-    assert_eq!(records[0].command, "claude --dangerously-skip-permissions");
+    assert_eq!(records[0].command, "codex --yolo");
     assert_eq!(records[0].status, "planned");
     assert_eq!(records[1].agent_id, agents[1].id);
     assert_eq!(records[1].command, "codex --yolo");

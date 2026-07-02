@@ -1328,6 +1328,7 @@ fn cmd_autopilot_run(prd_path: &str) -> Result<()> {
     let tasks = store.create_autopilot_tasks(run.id, &graph.tasks)?;
     let session_config = squad::autopilot::AutopilotConfig {
         model_mix: config.model_mix.clone(),
+        adaptive_scheduling: config.adaptive_scheduling.clone(),
         role_overrides: specs
             .iter()
             .map(|spec| (spec.role_id.clone(), spec.model_provider.clone()))
