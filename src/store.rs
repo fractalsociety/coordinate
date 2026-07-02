@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::autopilot::{
-    RiskLevel, TaskGraphStatus, TaskGraphTask, TerminalKind, TerminalSessionPlan,
-    TerminalSessionStatus,
+    claude_task_eligibility, AdaptiveSchedulingConfig, RiskLevel, TaskGraphStatus, TaskGraphTask,
+    TerminalKind, TerminalSessionPlan, TerminalSessionStatus,
 };
 use crate::tasks::TaskRecord;
 
@@ -583,16 +583,30 @@ impl Store {
             .cloned()
             .map(|worker| (worker.role.clone(), worker))
             .collect();
+        let claude_worker = workers
+            .iter()
+            .find(|worker| worker.model_provider.eq_ignore_ascii_case("claude"));
+        let codex_worker = workers
+            .iter()
+            .find(|worker| worker.model_provider.eq_ignore_ascii_case("codex"));
+        let adaptive_policy = AdaptiveSchedulingConfig::default();
         let mut assigned = Vec::with_capacity(ready_tasks.len());
         let mut next_worker_index = 0usize;
         for task in ready_tasks {
             let worker = if let Some(role) = task.assigned_role.as_deref() {
-                let worker = workers_by_role.get(role).with_context(|| {
+                let role_worker = workers_by_role.get(role).with_context(|| {
                     format!(
                         "ready autopilot task '{}' has no worker for role '{role}'",
                         task.id
                     )
                 })?;
+                let worker = if role_worker.model_provider.eq_ignore_ascii_case("claude")
+                    && !autopilot_record_is_claude_eligible(&task, &adaptive_policy)
+                {
+                    codex_worker.unwrap_or(role_worker)
+                } else {
+                    role_worker
+                };
                 if let Some(worker_index) = workers
                     .iter()
                     .position(|candidate| candidate.id == worker.id)
@@ -600,6 +614,18 @@ impl Store {
                     next_worker_index = worker_index + 1;
                 }
                 worker
+            } else if let Some(worker) = claude_worker
+                .filter(|_| autopilot_record_is_claude_eligible(&task, &adaptive_policy))
+            {
+                worker
+            } else if claude_worker.is_some() {
+                if let Some(worker) = codex_worker {
+                    worker
+                } else {
+                    let worker = &workers[next_worker_index % workers.len()];
+                    next_worker_index += 1;
+                    worker
+                }
             } else {
                 let worker = &workers[next_worker_index % workers.len()];
                 next_worker_index += 1;
@@ -1940,6 +1966,48 @@ fn model_provider_rank(provider: &str) -> i64 {
         "codex" => 4,
         "claude" => 5,
         _ => 0,
+    }
+}
+
+fn autopilot_record_is_claude_eligible(
+    task: &AutopilotTaskRecord,
+    policy: &AdaptiveSchedulingConfig,
+) -> bool {
+    claude_task_eligibility(
+        &TaskGraphTask {
+            id: format!("task-{}", task.id),
+            title: task.title.clone(),
+            description: task.description.clone(),
+            assigned_role: task.assigned_role.clone(),
+            status: task_status_from_record(&task.status),
+            priority: task.priority,
+            risk_level: risk_level_from_record(task.risk_level.as_deref()),
+            acceptance_criteria: task.acceptance_criteria.clone(),
+            likely_files: Vec::new(),
+            test_requirements: Vec::new(),
+            depends_on: Vec::new(),
+        },
+        policy,
+    )
+    .eligible
+}
+
+fn task_status_from_record(status: &str) -> TaskGraphStatus {
+    match status {
+        "READY_PARALLEL" => TaskGraphStatus::ReadyParallel,
+        "BLOCKED" => TaskGraphStatus::Blocked,
+        "REVIEW_REQUIRED" => TaskGraphStatus::ReviewRequired,
+        "DONE" => TaskGraphStatus::Done,
+        "FAILED" => TaskGraphStatus::Failed,
+        _ => TaskGraphStatus::Sequential,
+    }
+}
+
+fn risk_level_from_record(risk_level: Option<&str>) -> RiskLevel {
+    match risk_level {
+        Some("low") => RiskLevel::Low,
+        Some("high") => RiskLevel::High,
+        _ => RiskLevel::Medium,
     }
 }
 

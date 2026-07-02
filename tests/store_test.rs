@@ -565,6 +565,107 @@ fn test_assign_ready_autopilot_tasks_rejects_missing_worker_role() {
 }
 
 #[test]
+fn test_adaptive_assignment_routes_small_coding_to_claude_and_broad_work_to_codex() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(&tmp.path().join("messages.db")).unwrap();
+    let run = store.create_autopilot_run("./PRD.md").unwrap();
+    let agents = store
+        .create_autopilot_agents(
+            run.id,
+            &[
+                AutopilotAgentInput {
+                    model_provider: "claude".to_string(),
+                    ..autopilot_agent("Claude Small Coding Worker", "claude_coding_worker")
+                },
+                AutopilotAgentInput {
+                    model_provider: "codex".to_string(),
+                    ..autopilot_agent("Codex Worker", "coding_worker")
+                },
+            ],
+        )
+        .unwrap();
+    let mut small_coding = task_graph_task(
+        "task-1",
+        "Implement parser guard",
+        TaskGraphStatus::ReadyParallel,
+        RiskLevel::Low,
+        None,
+    );
+    small_coding.description = "Implement one guard in src/parser.rs and add one test.".to_string();
+    small_coding.acceptance_criteria = vec!["invalid input is rejected".to_string()];
+    let broad_docs = task_graph_task(
+        "task-2",
+        "Write architecture docs summary",
+        TaskGraphStatus::ReadyParallel,
+        RiskLevel::Low,
+        None,
+    );
+    store
+        .create_autopilot_tasks(run.id, &[small_coding, broad_docs])
+        .unwrap();
+
+    let assigned = store.assign_ready_autopilot_tasks(run.id).unwrap();
+
+    assert_eq!(assigned.len(), 2);
+    assert_eq!(assigned[0].title, "Implement parser guard");
+    assert_eq!(assigned[0].assigned_agent_id, Some(agents[0].id));
+    assert_eq!(
+        assigned[0].assigned_role.as_deref(),
+        Some("claude_coding_worker")
+    );
+    assert_eq!(assigned[1].title, "Write architecture docs summary");
+    assert_eq!(assigned[1].assigned_agent_id, Some(agents[1].id));
+    assert_eq!(assigned[1].assigned_role.as_deref(), Some("coding_worker"));
+}
+
+#[test]
+fn test_adaptive_assignment_reassigns_too_large_claude_role_task_to_codex() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(&tmp.path().join("messages.db")).unwrap();
+    let run = store.create_autopilot_run("./PRD.md").unwrap();
+    let agents = store
+        .create_autopilot_agents(
+            run.id,
+            &[
+                AutopilotAgentInput {
+                    model_provider: "claude".to_string(),
+                    ..autopilot_agent("Claude Small Coding Worker", "claude_coding_worker")
+                },
+                AutopilotAgentInput {
+                    model_provider: "codex".to_string(),
+                    ..autopilot_agent("Codex Worker", "coding_worker")
+                },
+            ],
+        )
+        .unwrap();
+    let mut broad = task_graph_task(
+        "task-1",
+        "Review architecture and summarize PRD",
+        TaskGraphStatus::ReadyParallel,
+        RiskLevel::Medium,
+        Some("claude_coding_worker"),
+    );
+    broad.description =
+        "Review the full architecture, summarize the PRD, and write docs.".to_string();
+    broad.acceptance_criteria = vec![
+        "architecture reviewed".to_string(),
+        "PRD summarized".to_string(),
+        "docs updated".to_string(),
+        "risks listed".to_string(),
+    ];
+    store.create_autopilot_tasks(run.id, &[broad]).unwrap();
+
+    let assigned = store.assign_ready_autopilot_tasks(run.id).unwrap();
+
+    assert_eq!(assigned.len(), 1);
+    assert_eq!(assigned[0].assigned_agent_id, Some(agents[1].id));
+    assert_eq!(
+        assigned[0].assigned_role.as_deref(),
+        Some("claude_coding_worker")
+    );
+}
+
+#[test]
 fn test_autopilot_review_lifecycle_accepts_and_completes_task() {
     let tmp = TempDir::new().unwrap();
     let store = Store::open(&tmp.path().join("messages.db")).unwrap();

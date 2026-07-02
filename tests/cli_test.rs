@@ -588,6 +588,92 @@ fn test_autopilot_launch_execute_delivers_ready_assignments_to_squad_tasks() {
 }
 
 #[test]
+fn test_autopilot_launch_execute_requires_ready_worker_before_assignment() {
+    let tmp = TempDir::new().unwrap();
+    squad(tmp.path()).arg("init").assert().success();
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let run = store.create_autopilot_run("./PRD.md").unwrap();
+    store
+        .create_autopilot_agents(
+            run.id,
+            &[
+                AutopilotAgentInput {
+                    name: "Autopilot Manager".to_string(),
+                    role: "manager".to_string(),
+                    model_provider: "claude".to_string(),
+                    skills_prompt: "Coordinate work.".to_string(),
+                },
+                AutopilotAgentInput {
+                    name: "Rust Backend Engineer".to_string(),
+                    role: "rust_backend".to_string(),
+                    model_provider: "codex".to_string(),
+                    skills_prompt: "Implement Rust changes.".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    store
+        .create_autopilot_tasks(
+            run.id,
+            &[TaskGraphTask {
+                id: "task-1".to_string(),
+                title: "Implement queue bridge".to_string(),
+                description: "Create normal squad task assignments for launched agents."
+                    .to_string(),
+                assigned_role: Some("rust_backend".to_string()),
+                status: TaskGraphStatus::ReadyParallel,
+                priority: 10,
+                risk_level: RiskLevel::Medium,
+                acceptance_criteria: vec!["Worker receives a queued task.".to_string()],
+                likely_files: Vec::new(),
+                test_requirements: Vec::new(),
+                depends_on: Vec::new(),
+            }],
+        )
+        .unwrap();
+    store.assign_ready_autopilot_tasks(run.id).unwrap();
+    store
+        .register_agent_with_metadata("manager", "manager", Some("claude"), Some(2))
+        .unwrap();
+    store
+        .register_agent_with_metadata("rust_backend", "rust_backend", Some("codex"), Some(1))
+        .unwrap();
+
+    let path_env = path_with_fake_osascript(&tmp);
+    let osascript_log = tmp.path().join("osascript.log");
+
+    squad(tmp.path())
+        .args([
+            "autopilot",
+            "launch",
+            "--run-id",
+            &run.id.to_string(),
+            "--terminal-backend",
+            "macos-terminal",
+            "--execute",
+            "--terminal-title",
+            "test-autopilot",
+        ])
+        .env("PATH", path_env)
+        .env("OSASCRIPT_LOG", &osascript_log)
+        .env("SQUAD_AUTOPILOT_ASSIGN_WAIT_SECS", "0")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Sequential macOS Terminal launch stopped; missing ready roles: rust_backend",
+        ))
+        .stdout(predicate::str::contains(
+            "Autopilot task delivery: 0 created, 0 already existed.",
+        ));
+
+    let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
+    let tasks = store
+        .list_tasks(Some("rust_backend"), Some("queued"))
+        .unwrap();
+    assert!(tasks.is_empty());
+}
+
+#[test]
 fn test_autopilot_launch_requires_run_id_flag() {
     let tmp = TempDir::new().unwrap();
 
