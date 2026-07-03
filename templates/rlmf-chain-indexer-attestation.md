@@ -5,7 +5,7 @@ Build or update RLMF chain commitment, attestation submission, indexer projectio
 
 ## Scope
 - Fractalwork commitment/projection/replay helpers.
-- FractalChain/fractalchain2 attestation stubs or adapters.
+- Canonical `fractalchain` / `fractalsociety/Fractal-node` attestation stubs or adapters.
 - Chain/indexer records for dataset, job, judge report, benchmark report, model artifact, promotion decision, proof-of-payment, and provenance hashes.
 
 ## Acceptance
@@ -22,4 +22,4 @@ Build or update RLMF chain commitment, attestation submission, indexer projectio
 
 ## Verification
 - Run focused Fractalwork projection/replay tests.
-- Run focused FractalChain/fractalchain2 attestation tests when Rust chain code changes.
+- Run focused `fractalchain` attestation tests when Rust chain code changes.
