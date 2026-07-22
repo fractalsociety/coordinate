@@ -1031,7 +1031,7 @@ where
             vec!["manager".to_string(), session.role_id.clone()]
         };
         let active_agents =
-            wait_for_active_autopilot_roles(store, &needed_roles, joined_at_or_after, wait_secs)?;
+            wait_for_ready_autopilot_roles(store, &needed_roles, joined_at_or_after, wait_secs)?;
         let missing_roles: Vec<String> = needed_roles
             .iter()
             .filter(|role| !active_agents.contains_key(role.as_str()))
@@ -1039,7 +1039,7 @@ where
             .collect();
         if !missing_roles.is_empty() {
             println!(
-                "Sequential {backend_label} launch stopped; missing active roles: {}",
+                "Sequential {backend_label} launch stopped; missing ready roles: {}",
                 missing_roles.join(", ")
             );
             delivery.add(AutopilotTaskDelivery {
@@ -1173,7 +1173,7 @@ fn squad_task_assignment_was_read(store: &squad::store::Store, task_id: &str) ->
     }))
 }
 
-fn wait_for_active_autopilot_roles(
+fn wait_for_ready_autopilot_roles(
     store: &squad::store::Store,
     roles: &[String],
     joined_at_or_after: i64,
@@ -1181,7 +1181,7 @@ fn wait_for_active_autopilot_roles(
 ) -> Result<BTreeMap<String, String>> {
     let deadline = chrono::Utc::now().timestamp() + wait_secs as i64;
     loop {
-        let active_agents = newest_active_agents_by_role(store, joined_at_or_after)?;
+        let active_agents = newest_ready_agents_by_role(store, joined_at_or_after)?;
         let all_present = roles
             .iter()
             .all(|role| active_agents.contains_key(role.as_str()));
@@ -1192,13 +1192,16 @@ fn wait_for_active_autopilot_roles(
     }
 }
 
-fn newest_active_agents_by_role(
+fn newest_ready_agents_by_role(
     store: &squad::store::Store,
     joined_at_or_after: i64,
 ) -> Result<BTreeMap<String, String>> {
     let mut newest: BTreeMap<String, (String, i64)> = BTreeMap::new();
     for agent in store.list_agents(false)? {
         if agent.joined_at < joined_at_or_after {
+            continue;
+        }
+        if !supports_capability(&agent) {
             continue;
         }
         let replace = newest
