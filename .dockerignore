@@ -1,0 +1,5 @@
+target/
+.squad/
+*.db
+*.db-shm
+*.db-wal

@@ -276,6 +276,21 @@ fn test_autopilot_plan_requires_prd_path() {
 }
 
 #[test]
+fn test_host_bridge_help_documents_tmux_worker_contract() {
+    let tmp = TempDir::new().unwrap();
+
+    squad(tmp.path())
+        .args(["host-bridge", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "squad host-bridge --worker-id <id> --tmux-target <target>",
+        ))
+        .stdout(predicate::str::contains("COORDINATE_REPORT_JSON"))
+        .stdout(predicate::str::contains("COORDINATE_BLOCKED"));
+}
+
+#[test]
 fn test_autopilot_launch_prints_terminal_session_plan_for_run() {
     let tmp = TempDir::new().unwrap();
     squad(tmp.path()).arg("init").assert().success();
@@ -1492,6 +1507,8 @@ fn test_readmes_describe_receive_timeout_debug_path() {
     assert!(readme.contains("| `squad task create <from> <to> --title <title> [--body <body>]` |"));
     assert!(readme.contains("| `squad task complete <agent> <task-id> --summary <text>` |"));
     assert!(readme.contains("| `squad task list [--agent <id>] [--status <status>]` |"));
+    assert!(readme.contains("| Coordinate HTTP `POST /tasks/next` |"));
+    assert!(readme.contains("| Coordinate HTTP `GET /tasks/stats` |"));
     assert!(readme_zh.contains("| `squad receive <id> [--wait] [--json]` |"));
     assert!(
         readme_zh.contains("| `squad task create <from> <to> --title <title> [--body <body>]` |")
@@ -1554,11 +1571,10 @@ fn test_role_prompts_prefer_task_commands_with_send_receive_fallback() {
     let worker_role = std::fs::read_to_string("src/roles/worker.md").unwrap();
     let inspector_role = std::fs::read_to_string("src/roles/inspector.md").unwrap();
 
-    assert!(manager_role.contains(
-        "Prefer `squad task create manager <agent> --title \"<title>\" [--body \"<body>\"]`"
-    ));
+    assert!(manager_role.contains("Prefer shared queue work for normal execution"));
     assert!(manager_role.contains("keep `squad send` / `squad receive` as the fallback path"));
-    assert!(worker_role.contains("Prefer `squad task ack <your-id> <task-id>` and `squad task complete <your-id> <task-id> --summary \"<summary>\"`"));
+    assert!(worker_role.contains("In host-bridge mode, work arrives by pull claim"));
+    assert!(worker_role.contains("COORDINATE_REPORT_JSON"));
     assert!(worker_role.contains("keep `squad send` / `squad receive` as the fallback path"));
     assert!(inspector_role.contains("Prefer `squad send --task-id <task-id> --reply-to <message-id> <your-id> <worker-id> \"<specific feedback>\"`"));
     assert!(

@@ -4550,6 +4550,545 @@ pub fn independent_verification_task_template(id: &str) -> TaskGraphTask {
     }
 }
 
+/// Ready template for a Coordinate pull-queue worker that runs one Life agent.
+///
+/// The worker is intentionally stateless: every cycle starts by reading
+/// Fractalwork's Life API, then it claims only one action batch for one soul.
+pub fn life_daemon_worker_task_template(id: &str) -> TaskGraphTask {
+    TaskGraphTask {
+        id: id.to_string(),
+        title: "Run restart-safe Coordinate Life daemon worker".to_string(),
+        description: "Implement a pull-queue worker loop for one Life soul: perceive Fractalwork state, choose a capped action plan, submit API actions, record checkpoint/result, and never rely on local memory for authority.".to_string(),
+        assigned_role: Some("life_daemon_worker".to_string()),
+        status: TaskGraphStatus::ReadyParallel,
+        priority: 80,
+        risk_level: RiskLevel::Medium,
+        acceptance_criteria: vec![
+            "Every daemon cycle begins with Fractalwork GET reads for agent, PnL, kin, dashboard, and relevant LayerScope/job state.".to_string(),
+            "Planned POST actions include deterministic idempotency keys and stay under per-agent per-epoch spend caps.".to_string(),
+            "Worker checkpoints include observed epoch, selected policy, action ids, costs, and API result summaries.".to_string(),
+        ],
+        likely_files: vec![
+            "squad-coordinate-sync/src/autopilot.rs".to_string(),
+            "squad-coordinate-sync/templates/life-daemon-worker.md".to_string(),
+        ],
+        test_requirements: vec![
+            "cargo test -p squad life_daemon".to_string(),
+            "Planner test proves survival mode blocks nonessential spend.".to_string(),
+        ],
+        depends_on: Vec::new(),
+    }
+}
+
+pub fn data_librarian_archetype_task_template(id: &str) -> TaskGraphTask {
+    TaskGraphTask {
+        id: id.to_string(),
+        title: "Seed Data-Librarian NPC archetype policy".to_string(),
+        description: "Define the first NPC daemon archetype: scout DataEvol artifacts, import storage attribution, publish a dataset/feed storefront, observe demand, and reinvest only after survival reserve is met.".to_string(),
+        assigned_role: Some("life_policy_worker".to_string()),
+        status: TaskGraphStatus::ReadyParallel,
+        priority: 75,
+        risk_level: RiskLevel::Medium,
+        acceptance_criteria: vec![
+            "Data-Librarian plan uses DataEvol import and storefront APIs before any reproduction/teaching spend.".to_string(),
+            "Verifier and entrepreneur seed policies are represented as lower-priority alternatives.".to_string(),
+            "Policy output contains explicit endpoints, costs, and idempotency keys.".to_string(),
+        ],
+        likely_files: vec![
+            "squad-coordinate-sync/src/autopilot.rs".to_string(),
+            "squad-coordinate-sync/templates/life-archetypes.md".to_string(),
+        ],
+        test_requirements: vec!["cargo test -p squad life_daemon".to_string()],
+        depends_on: vec!["31".to_string()],
+    }
+}
+
+pub fn teaching_before_death_task_template(id: &str) -> TaskGraphTask {
+    TaskGraphTask {
+        id: id.to_string(),
+        title: "Teach before death with LayerScope specialist and unborn heir will".to_string(),
+        description: "When a Life daemon has late-life surplus, train/register a LayerScope specialist and write a will containing an unborn-heir genome that references the teaching artifact.".to_string(),
+        assigned_role: Some("life_policy_worker".to_string()),
+        status: TaskGraphStatus::ReadyParallel,
+        priority: 70,
+        risk_level: RiskLevel::Medium,
+        acceptance_criteria: vec![
+            "Teaching spend only occurs when survival reserve and per-epoch cap leave surplus.".to_string(),
+            "The plan queues a LayerScope build-specialist job with trace/dataset input refs.".to_string(),
+            "The will includes an unborn heir genome whose metadata references the specialist job or manifest.".to_string(),
+        ],
+        likely_files: vec![
+            "squad-coordinate-sync/src/autopilot.rs".to_string(),
+            "squad-coordinate-sync/templates/life-daemon-worker.md".to_string(),
+        ],
+        test_requirements: vec!["cargo test -p squad life_daemon".to_string()],
+        depends_on: vec!["31".to_string()],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifeDaemonArchetype {
+    DataLibrarian,
+    Verifier,
+    Entrepreneur,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeDaemonSoulSnapshot {
+    pub soul_id: String,
+    pub class: String,
+    pub status: String,
+    pub balance_micro_credits: u64,
+    pub debt_micro_credits: u64,
+    pub epoch: u64,
+    pub natural_death_epoch: u64,
+    pub child_count: usize,
+    pub active_storefront_count: usize,
+    pub open_layerscope_job_count: usize,
+    pub latest_sii_milli: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeDaemonPolicy {
+    pub archetype: LifeDaemonArchetype,
+    pub per_epoch_spend_cap_micro_credits: u64,
+    pub survival_reserve_epochs: u64,
+    pub rent_per_epoch_micro_credits: u64,
+    pub teaching_window_epochs: u64,
+    pub min_teaching_surplus_micro_credits: u64,
+    pub max_children: usize,
+    pub base_model_id: String,
+    pub task_type: String,
+}
+
+impl Default for LifeDaemonPolicy {
+    fn default() -> Self {
+        Self {
+            archetype: LifeDaemonArchetype::DataLibrarian,
+            per_epoch_spend_cap_micro_credits: 150_000,
+            survival_reserve_epochs: 3,
+            rent_per_epoch_micro_credits: 100_000,
+            teaching_window_epochs: 10,
+            min_teaching_surplus_micro_credits: 300_000,
+            max_children: 3,
+            base_model_id: "mlx-community/Qwen2.5-1.5B-Instruct-4bit".to_string(),
+            task_type: "life-data-librarian".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeDaemonPlan {
+    pub soul_id: String,
+    pub epoch: u64,
+    pub archetype: LifeDaemonArchetype,
+    pub mode: String,
+    pub spend_cap_micro_credits: u64,
+    pub planned_spend_micro_credits: u64,
+    pub read_steps: Vec<LifeDaemonApiStep>,
+    pub actions: Vec<LifeDaemonApiStep>,
+    pub checkpoint: LifeDaemonCheckpoint,
+    pub blocked_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeDaemonApiStep {
+    pub method: String,
+    pub path: String,
+    pub body_json: Option<String>,
+    pub expected_cost_micro_credits: u64,
+    pub idempotency_key: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeDaemonCheckpoint {
+    pub checkpoint_id: String,
+    pub observed_epoch: u64,
+    pub soul_id: String,
+    pub policy: String,
+    pub action_count: usize,
+    pub planned_spend_micro_credits: u64,
+}
+
+pub fn plan_life_daemon_cycle(
+    snapshot: &LifeDaemonSoulSnapshot,
+    policy: &LifeDaemonPolicy,
+) -> LifeDaemonPlan {
+    let spend_cap = policy
+        .per_epoch_spend_cap_micro_credits
+        .min(snapshot.balance_micro_credits);
+    let survival_reserve = policy
+        .rent_per_epoch_micro_credits
+        .saturating_mul(policy.survival_reserve_epochs);
+    let epochs_remaining = snapshot.natural_death_epoch.saturating_sub(snapshot.epoch);
+    let survival_mode = snapshot.status != "alive"
+        || snapshot.debt_micro_credits > 0
+        || snapshot.balance_micro_credits <= survival_reserve;
+    let mut actions = Vec::new();
+    let mut blocked_reasons = Vec::new();
+
+    if snapshot.status != "alive" {
+        blocked_reasons.push(format!("soul status is {}", snapshot.status));
+    }
+
+    let read_steps = life_daemon_read_steps(&snapshot.soul_id);
+    let mut spent = 0_u64;
+
+    if survival_mode {
+        push_action(
+            &mut actions,
+            &mut spent,
+            spend_cap,
+            step(
+                "POST",
+                "/v1/life/task-slices/run",
+                Some(format!(
+                    r#"{{"soulId":"{}","mode":"survival"}}"#,
+                    snapshot.soul_id
+                )),
+                0,
+                "run frozen survival benchmark before spending",
+                snapshot,
+            ),
+            &mut blocked_reasons,
+        );
+        if snapshot.debt_micro_credits > 0 {
+            blocked_reasons.push("debt present: nonessential spend blocked".to_string());
+        }
+    } else {
+        match policy.archetype {
+            LifeDaemonArchetype::DataLibrarian => {
+                plan_data_librarian(
+                    snapshot,
+                    policy,
+                    spend_cap,
+                    &mut spent,
+                    &mut actions,
+                    &mut blocked_reasons,
+                );
+            }
+            LifeDaemonArchetype::Verifier => {
+                plan_verifier(
+                    snapshot,
+                    spend_cap,
+                    &mut spent,
+                    &mut actions,
+                    &mut blocked_reasons,
+                );
+            }
+            LifeDaemonArchetype::Entrepreneur => {
+                plan_entrepreneur(
+                    snapshot,
+                    spend_cap,
+                    &mut spent,
+                    &mut actions,
+                    &mut blocked_reasons,
+                );
+            }
+        }
+
+        if epochs_remaining <= policy.teaching_window_epochs {
+            plan_teaching_before_death(
+                snapshot,
+                policy,
+                spend_cap,
+                &mut spent,
+                &mut actions,
+                &mut blocked_reasons,
+            );
+        }
+    }
+
+    let mode = if survival_mode {
+        "survival".to_string()
+    } else if epochs_remaining <= policy.teaching_window_epochs {
+        "teach-before-death".to_string()
+    } else {
+        "growth".to_string()
+    };
+    let checkpoint = LifeDaemonCheckpoint {
+        checkpoint_id: format!("life-daemon-{}-{}", snapshot.soul_id, snapshot.epoch),
+        observed_epoch: snapshot.epoch,
+        soul_id: snapshot.soul_id.clone(),
+        policy: format!("{:?}", policy.archetype),
+        action_count: actions.len(),
+        planned_spend_micro_credits: spent,
+    };
+
+    LifeDaemonPlan {
+        soul_id: snapshot.soul_id.clone(),
+        epoch: snapshot.epoch,
+        archetype: policy.archetype.clone(),
+        mode,
+        spend_cap_micro_credits: spend_cap,
+        planned_spend_micro_credits: spent,
+        read_steps,
+        actions,
+        checkpoint,
+        blocked_reasons,
+    }
+}
+
+fn life_daemon_read_steps(soul_id: &str) -> Vec<LifeDaemonApiStep> {
+    [
+        format!("/v1/life/agents/{soul_id}"),
+        format!("/v1/life/agents/{soul_id}/pnl"),
+        format!("/v1/life/agents/{soul_id}/kin"),
+        "/v1/life/dashboard".to_string(),
+        "/v1/layerscope/jobs".to_string(),
+    ]
+    .into_iter()
+    .map(|path| LifeDaemonApiStep {
+        method: "GET".to_string(),
+        idempotency_key: format!("read:{path}"),
+        purpose: "perceive authoritative state from Fractalwork".to_string(),
+        path,
+        body_json: None,
+        expected_cost_micro_credits: 0,
+    })
+    .collect()
+}
+
+fn plan_data_librarian(
+    snapshot: &LifeDaemonSoulSnapshot,
+    policy: &LifeDaemonPolicy,
+    cap: u64,
+    spent: &mut u64,
+    actions: &mut Vec<LifeDaemonApiStep>,
+    blocked: &mut Vec<String>,
+) {
+    push_action(
+        actions,
+        spent,
+        cap,
+        step(
+            "POST",
+            "/v1/life/storage-attributions/import-dataevol",
+            Some(format!(
+                r#"{{"soulId":"{}","manifestRef":"dataevol://life/{}/latest"}}"#,
+                snapshot.soul_id, snapshot.soul_id
+            )),
+            25_000,
+            "scout and import DataEvol dataset/feed artifacts",
+            snapshot,
+        ),
+        blocked,
+    );
+    if snapshot.active_storefront_count == 0 {
+        push_action(
+            actions,
+            spent,
+            cap,
+            step(
+                "POST",
+                "/v1/life/storefronts",
+                Some(format!(
+                    r#"{{"sellerSoulId":"{}","assetKind":"dataset","title":"{} curated data feed","priceMicroCredits":50000,"royaltyBps":500,"metadata":{{"archetype":"data_librarian"}}}}"#,
+                    snapshot.soul_id, snapshot.soul_id
+                )),
+                10_000,
+                "publish curated dataset storefront after attribution import",
+                snapshot,
+            ),
+            blocked,
+        );
+    }
+    push_action(
+        actions,
+        spent,
+        cap,
+        step(
+            "POST",
+            "/v1/life/task-slices/run",
+            Some(format!(
+                r#"{{"soulId":"{}","mode":"data_librarian"}}"#,
+                snapshot.soul_id
+            )),
+            0,
+            "measure current frozen benchmark usefulness before reinvestment",
+            snapshot,
+        ),
+        blocked,
+    );
+    if snapshot.child_count < policy.max_children && snapshot.latest_sii_milli >= 650 {
+        push_action(
+            actions,
+            spent,
+            cap,
+            step(
+                "POST",
+                &format!("/v1/life/agents/{}/spawn", snapshot.soul_id),
+                Some(format!(
+                    r#"{{"class":"npc","genome":{{"genomeId":"{}-data-heir","manifestHash":"{}","byteSize":2048,"metadata":{{"archetype":"data_librarian"}}}}}}"#,
+                    snapshot.soul_id,
+                    "d".repeat(64)
+                )),
+                125_000,
+                "reproduce only after useful benchmark signal and child cap check",
+                snapshot,
+            ),
+            blocked,
+        );
+    }
+}
+
+fn plan_verifier(
+    snapshot: &LifeDaemonSoulSnapshot,
+    cap: u64,
+    spent: &mut u64,
+    actions: &mut Vec<LifeDaemonApiStep>,
+    blocked: &mut Vec<String>,
+) {
+    push_action(
+        actions,
+        spent,
+        cap,
+        step(
+            "POST",
+            "/v1/life/task-slices/run",
+            Some(format!(
+                r#"{{"soulId":"{}","mode":"verifier"}}"#,
+                snapshot.soul_id
+            )),
+            0,
+            "run verifier slice and publish score evidence",
+            snapshot,
+        ),
+        blocked,
+    );
+}
+
+fn plan_entrepreneur(
+    snapshot: &LifeDaemonSoulSnapshot,
+    cap: u64,
+    spent: &mut u64,
+    actions: &mut Vec<LifeDaemonApiStep>,
+    blocked: &mut Vec<String>,
+) {
+    if snapshot.active_storefront_count == 0 {
+        push_action(
+            actions,
+            spent,
+            cap,
+            step(
+                "POST",
+                "/v1/life/storefronts",
+                Some(format!(
+                    r#"{{"sellerSoulId":"{}","assetKind":"tool","title":"{} service bundle","priceMicroCredits":75000,"royaltyBps":700,"metadata":{{"archetype":"entrepreneur"}}}}"#,
+                    snapshot.soul_id, snapshot.soul_id
+                )),
+                15_000,
+                "publish a priced tool/service bundle",
+                snapshot,
+            ),
+            blocked,
+        );
+    }
+}
+
+fn plan_teaching_before_death(
+    snapshot: &LifeDaemonSoulSnapshot,
+    policy: &LifeDaemonPolicy,
+    cap: u64,
+    spent: &mut u64,
+    actions: &mut Vec<LifeDaemonApiStep>,
+    blocked: &mut Vec<String>,
+) {
+    let reserve = policy
+        .rent_per_epoch_micro_credits
+        .saturating_mul(policy.survival_reserve_epochs);
+    let surplus = snapshot.balance_micro_credits.saturating_sub(reserve);
+    if surplus < policy.min_teaching_surplus_micro_credits {
+        blocked.push(
+            "late-life teaching blocked: insufficient surplus after survival reserve".to_string(),
+        );
+        return;
+    }
+    if snapshot.open_layerscope_job_count == 0 {
+        push_action(
+            actions,
+            spent,
+            cap,
+            step(
+                "POST",
+                "/v1/layerscope/jobs",
+                Some(format!(
+                    r#"{{"jobType":"build-specialist","runtime":"host-mlx","modelId":"{}","taskType":"{}","trainingMode":"sft","inputRefs":["life://souls/{}/traces"],"metadata":{{"soulId":"{}","purpose":"teaching-before-death"}}}}"#,
+                    policy.base_model_id, policy.task_type, snapshot.soul_id, snapshot.soul_id
+                )),
+                policy.min_teaching_surplus_micro_credits.min(200_000),
+                "teach accumulated skill into a LayerScope specialist",
+                snapshot,
+            ),
+            blocked,
+        );
+    }
+    push_action(
+        actions,
+        spent,
+        cap,
+        step(
+            "POST",
+            "/v1/life/wills",
+            Some(format!(
+                r#"{{"soulId":"{}","unbornHeirs":[{{"genomeId":"{}-taught-heir","manifestHash":"{}","byteSize":4096,"metadata":{{"teachingJob":"layerscope","baseModelId":"{}","taskType":"{}"}}}}]}}"#,
+                snapshot.soul_id,
+                snapshot.soul_id,
+                "a".repeat(64),
+                policy.base_model_id,
+                policy.task_type
+            )),
+            0,
+            "register unborn-heir spawn spec carrying teaching artifact lineage",
+            snapshot,
+        ),
+        blocked,
+    );
+}
+
+fn push_action(
+    actions: &mut Vec<LifeDaemonApiStep>,
+    spent: &mut u64,
+    cap: u64,
+    action: LifeDaemonApiStep,
+    blocked: &mut Vec<String>,
+) {
+    if spent.saturating_add(action.expected_cost_micro_credits) > cap {
+        blocked.push(format!(
+            "blocked {}: cost {} would exceed cap {}",
+            action.path, action.expected_cost_micro_credits, cap
+        ));
+        return;
+    }
+    *spent = spent.saturating_add(action.expected_cost_micro_credits);
+    actions.push(action);
+}
+
+fn step(
+    method: &str,
+    path: &str,
+    body_json: Option<String>,
+    expected_cost_micro_credits: u64,
+    purpose: &str,
+    snapshot: &LifeDaemonSoulSnapshot,
+) -> LifeDaemonApiStep {
+    LifeDaemonApiStep {
+        method: method.to_string(),
+        path: path.to_string(),
+        body_json,
+        expected_cost_micro_credits,
+        idempotency_key: format!(
+            "life-daemon:{}:{}:{}",
+            snapshot.soul_id,
+            snapshot.epoch,
+            path.replace('/', "_")
+        ),
+        purpose: purpose.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationCheck {
     pub passed: bool,

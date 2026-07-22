@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 
 use crate::autopilot::{
@@ -16,6 +18,40 @@ const TASK_STATUS_QUEUED: &str = "queued";
 const TASK_STATUS_ACKED: &str = "acked";
 const TASK_STATUS_COMPLETED: &str = "completed";
 const TASK_LEASE_SECS: i64 = 15 * 60;
+const WORKER_STATE_STARTING: &str = "starting";
+const WORKER_STATE_READY: &str = "ready";
+const WORKER_STATE_ASSIGNED: &str = "assigned";
+const WORKER_STATE_WORKING: &str = "working";
+const WORKER_STATE_BLOCKED: &str = "blocked";
+const WORKER_STATE_OFFLINE: &str = "offline";
+const TASK_STATE_QUEUED: &str = "queued";
+const TASK_STATE_ASSIGNED: &str = "assigned";
+const TASK_STATE_ACKED: &str = "acked";
+const TASK_STATE_WORKING: &str = "working";
+const TASK_STATE_REPORTED: &str = "reported";
+const TASK_STATE_VERIFIED: &str = "verified";
+const TASK_STATE_COMPLETE: &str = "complete";
+const TASK_STATE_FAILED: &str = "failed";
+const TASK_STATE_BLOCKED: &str = "blocked";
+const DEFAULT_SERVICE_TASK_MAX_ATTEMPTS: i64 = 3;
+pub const DEFAULT_SERVICE_CLAIM_LEASE_SECS: i64 = 15 * 60;
+pub const DEFAULT_SERVICE_LANE_ESCAPE_SECS: i64 = 300;
+
+pub fn normalize_service_provider_lane(spec: Option<&str>) -> Option<String> {
+    let spec = spec?.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let parts = spec
+        .split(',')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() || parts.iter().any(|part| part == "any") {
+        return None;
+    }
+    Some(parts.join(","))
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentRecord {
@@ -44,6 +80,202 @@ pub struct MessageRecord {
 
 pub struct Store {
     conn: Connection,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceHealthRecord {
+    pub status: String,
+    pub version: String,
+    pub database: String,
+    pub scheduler: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceWorkerRecord {
+    pub id: String,
+    pub kind: String,
+    pub role: String,
+    pub status: String,
+    pub capacity: i64,
+    pub current_task_id: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    pub metadata: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTaskRecord {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Vec<String>,
+    pub source_prd_path: String,
+    pub source_task_number: Option<String>,
+    pub state: String,
+    pub priority: i64,
+    pub preferred_model: String,
+    pub role: String,
+    pub parallelizable: bool,
+    pub dependencies: Vec<String>,
+    pub scheduling_pool: String,
+    pub estimated_size: String,
+    pub claude_suitable: bool,
+    pub assigned_worker_id: Option<String>,
+    pub eligible_providers: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub claimed_at: Option<String>,
+    pub completed_worker_id: Option<String>,
+    pub completed_worker_kind: Option<String>,
+    pub claim_duration_secs: Option<i64>,
+    pub retry_count: i64,
+    pub failure_reason: Option<String>,
+    pub attempt: i64,
+    pub max_attempts: i64,
+    pub acked_at: Option<String>,
+    pub started_at: Option<String>,
+    pub reported_at: Option<String>,
+    pub verified_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub last_error: Option<String>,
+    pub retry_reason: Option<String>,
+    pub report_hash: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTaskReportRecord {
+    pub task_id: String,
+    pub summary: String,
+    pub files_inspected: Vec<String>,
+    pub changed_files: Vec<String>,
+    pub tests_run: Vec<String>,
+    pub verification: String,
+    pub risks: String,
+    pub raw_report: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicePrdRecord {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceEventRecord {
+    pub id: String,
+    pub event_type: String,
+    pub worker_id: Option<String>,
+    pub task_id: Option<String>,
+    pub payload: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStaleRequeueResult {
+    pub requeued: Vec<ServiceTaskRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStaleWorkerResult {
+    pub offline_workers: Vec<ServiceWorkerRecord>,
+    pub requeued: Vec<ServiceTaskRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceQueueReapResult {
+    pub lease_expired: Vec<ServiceTaskRecord>,
+    pub assignment_released: Vec<ServiceTaskRecord>,
+    pub failed: Vec<ServiceTaskRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceQueueLaneStat {
+    pub lane: String,
+    pub queued: i64,
+    pub oldest_age_secs: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceQueueProviderStat {
+    pub worker_kind: String,
+    pub in_flight: i64,
+    pub completed_window: i64,
+    pub avg_claim_duration_secs: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceQueueStats {
+    pub lanes: Vec<ServiceQueueLaneStat>,
+    pub directly_assigned_queued: i64,
+    pub total_queued: i64,
+    pub total_in_flight: i64,
+    pub providers: Vec<ServiceQueueProviderStat>,
+    pub pool_sizing_hint: Option<String>,
+    pub window_secs: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceWorkerInput {
+    pub id: String,
+    pub kind: String,
+    pub role: String,
+    pub status: Option<String>,
+    pub capacity: Option<i64>,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTaskInput {
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Vec<String>,
+    pub source_prd_path: String,
+    pub source_task_number: Option<String>,
+    pub priority: i64,
+    pub preferred_model: String,
+    pub role: String,
+    pub parallelizable: bool,
+    pub max_attempts: Option<i64>,
+    pub dependencies: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTaskReportInput {
+    pub summary: String,
+    pub files_inspected: Vec<String>,
+    pub changed_files: Vec<String>,
+    pub tests_run: Vec<String>,
+    pub verification: String,
+    pub risks: String,
+    pub raw_report: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTaskProgressInput {
+    pub summary: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -289,6 +521,83 @@ impl Store {
                  evidence TEXT,
                  blocking INTEGER DEFAULT 0,
                  created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS service_workers (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 capacity INTEGER NOT NULL DEFAULT 1,
+                 current_task_id TEXT,
+                 last_heartbeat_at TEXT,
+                 metadata TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS service_tasks (
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 description TEXT NOT NULL,
+                 acceptance_criteria TEXT NOT NULL,
+                 source_prd_path TEXT NOT NULL,
+                 source_task_number TEXT,
+                 state TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0,
+	                 preferred_model TEXT NOT NULL,
+	                 role TEXT NOT NULL,
+	                 parallelizable INTEGER NOT NULL DEFAULT 1,
+	                 dependencies TEXT NOT NULL DEFAULT '[]',
+	                 scheduling_pool TEXT NOT NULL DEFAULT 'codex',
+		                 estimated_size TEXT NOT NULL DEFAULT 'small',
+		                 claude_suitable INTEGER NOT NULL DEFAULT 0,
+		                 assigned_worker_id TEXT,
+		                 eligible_providers TEXT,
+		                 lease_owner TEXT,
+		                 lease_expires_at TEXT,
+		                 claimed_at TEXT,
+		                 completed_worker_id TEXT,
+		                 completed_worker_kind TEXT,
+		                 claim_duration_secs INTEGER,
+		                 retry_count INTEGER NOT NULL DEFAULT 0,
+		                 failure_reason TEXT,
+	                 attempt INTEGER NOT NULL DEFAULT 0,
+	                 max_attempts INTEGER NOT NULL DEFAULT 3,
+	                 acked_at TEXT,
+	                 started_at TEXT,
+	                 reported_at TEXT,
+	                 verified_at TEXT,
+	                 completed_at TEXT,
+	                 last_error TEXT,
+	                 retry_reason TEXT,
+	                 report_hash TEXT,
+	                 created_at TEXT NOT NULL,
+	                 updated_at TEXT NOT NULL
+	             );
+             CREATE TABLE IF NOT EXISTS service_task_reports (
+                 task_id TEXT PRIMARY KEY,
+                 summary TEXT NOT NULL,
+                 files_inspected TEXT NOT NULL,
+                 changed_files TEXT NOT NULL,
+                 tests_run TEXT NOT NULL,
+                 verification TEXT NOT NULL,
+                 risks TEXT NOT NULL,
+                 raw_report TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS service_prds (
+                 id TEXT PRIMARY KEY,
+                 path TEXT NOT NULL UNIQUE,
+                 title TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS service_events (
+                 id TEXT PRIMARY KEY,
+                 type TEXT NOT NULL,
+                 worker_id TEXT,
+                 task_id TEXT,
+                 payload TEXT NOT NULL,
+                 created_at TEXT NOT NULL
              );",
         )?;
         // Migrations: add columns if missing (existing DBs)
@@ -311,6 +620,31 @@ impl Store {
             "UPDATE messages SET kind = ?1 WHERE kind IS NULL OR kind = ''",
             [DEFAULT_MESSAGE_KIND],
         );
+        for migration in [
+            "ALTER TABLE service_tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE service_tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3;",
+            "ALTER TABLE service_tasks ADD COLUMN acked_at TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN started_at TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN reported_at TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN verified_at TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN completed_at TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN last_error TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN retry_reason TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN report_hash TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN dependencies TEXT NOT NULL DEFAULT '[]';",
+            "ALTER TABLE service_tasks ADD COLUMN scheduling_pool TEXT NOT NULL DEFAULT 'codex';",
+            "ALTER TABLE service_tasks ADD COLUMN estimated_size TEXT NOT NULL DEFAULT 'small';",
+            "ALTER TABLE service_tasks ADD COLUMN claude_suitable INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE service_tasks ADD COLUMN eligible_providers TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN lease_owner TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN lease_expires_at TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN claimed_at TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN completed_worker_id TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN completed_worker_kind TEXT;",
+            "ALTER TABLE service_tasks ADD COLUMN claim_duration_secs INTEGER;",
+        ] {
+            let _ = conn.execute_batch(migration);
+        }
         Ok(Self { conn })
     }
 
@@ -1725,6 +2059,1504 @@ impl Store {
             .with_context(|| format!("task {task_id} does not exist"))
     }
 
+    pub fn service_health(&self) -> Result<ServiceHealthRecord> {
+        let _: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM service_tasks", [], |row| row.get(0))
+            .context("failed to query service task table")?;
+        Ok(ServiceHealthRecord {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            database: "ok".to_string(),
+            scheduler: "ready".to_string(),
+        })
+    }
+
+    pub fn service_register_worker(
+        &self,
+        input: ServiceWorkerInput,
+    ) -> Result<ServiceWorkerRecord> {
+        let id = required_service_field("worker id", &input.id)?;
+        let kind = normalized_worker_kind(&input.kind)?;
+        let role = required_service_field("worker role", &input.role)?;
+        let status =
+            normalized_worker_status(input.status.as_deref().unwrap_or(WORKER_STATE_READY))?;
+        let capacity = input.capacity.unwrap_or(1);
+        if capacity < 1 {
+            anyhow::bail!("worker capacity must be positive");
+        }
+        let now = service_now();
+        self.conn.execute(
+            "INSERT INTO service_workers (
+                id, kind, role, status, capacity, current_task_id, last_heartbeat_at,
+                metadata, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                role = excluded.role,
+                status = excluded.status,
+                capacity = excluded.capacity,
+                last_heartbeat_at = excluded.last_heartbeat_at,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at",
+            params![
+                id,
+                kind,
+                role,
+                status,
+                capacity,
+                now,
+                input.metadata.as_deref(),
+                now
+            ],
+        )?;
+        self.service_record_event(
+            "worker.registered",
+            Some(&id),
+            None,
+            &serde_json::json!({"kind": kind, "role": role}),
+        )?;
+        self.service_get_worker(&id)?
+            .with_context(|| format!("registered service worker disappeared: {id}"))
+    }
+
+    pub fn service_heartbeat_worker(
+        &self,
+        worker_id: &str,
+        status: Option<&str>,
+    ) -> Result<ServiceWorkerRecord> {
+        let worker = self
+            .service_get_worker(worker_id)?
+            .with_context(|| format!("service worker does not exist: {worker_id}"))?;
+        let status = normalized_worker_status(status.unwrap_or(&worker.status))?;
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_workers
+             SET status = ?1, last_heartbeat_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+            params![status, now, worker_id],
+        )?;
+        ensure_service_updated(updated, "worker", worker_id)?;
+        self.service_record_event(
+            "worker.heartbeat",
+            Some(worker_id),
+            worker.current_task_id.as_deref(),
+            &serde_json::json!({"status": status}),
+        )?;
+        self.service_get_worker(worker_id)?
+            .with_context(|| format!("service worker disappeared: {worker_id}"))
+    }
+
+    pub fn service_mark_worker_ready(&self, worker_id: &str) -> Result<ServiceWorkerRecord> {
+        self.service_set_worker_status(worker_id, WORKER_STATE_READY, "worker.ready")
+    }
+
+    pub fn service_mark_worker_offline(&self, worker_id: &str) -> Result<ServiceWorkerRecord> {
+        let worker = self
+            .service_get_worker(worker_id)?
+            .with_context(|| format!("service worker does not exist: {worker_id}"))?;
+        let now = service_now();
+        self.conn.execute(
+            "UPDATE service_workers
+	             SET status = ?1, current_task_id = NULL, updated_at = ?2
+	             WHERE id = ?3",
+            params![WORKER_STATE_OFFLINE, now, worker_id],
+        )?;
+        if let Some(task_id) = worker.current_task_id.as_deref() {
+            let task = self.require_service_task(task_id)?;
+            if task.attempt >= task.max_attempts {
+                self.conn.execute(
+                    "UPDATE service_tasks
+	                     SET state = ?1,
+	                         failure_reason = 'worker offline exceeded max attempts',
+	                         last_error = 'worker offline exceeded max attempts',
+	                         updated_at = ?2
+	                     WHERE id = ?3 AND state IN ('assigned', 'acked', 'working')",
+                    params![TASK_STATE_FAILED, now, task_id],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE service_tasks
+	                     SET state = ?1,
+	                         assigned_worker_id = NULL,
+	                         retry_count = retry_count + 1,
+	                         attempt = attempt + 1,
+	                         failure_reason = 'worker offline',
+	                         retry_reason = 'worker offline',
+	                         last_error = 'worker offline',
+	                         updated_at = ?2
+	                     WHERE id = ?3 AND state IN ('assigned', 'acked', 'working')",
+                    params![TASK_STATE_QUEUED, now, task_id],
+                )?;
+            }
+            self.service_record_event(
+                "task.retry",
+                Some(worker_id),
+                Some(task_id),
+                &serde_json::json!({"reason": "worker offline"}),
+            )?;
+        }
+        self.service_record_event(
+            "worker.offline",
+            Some(worker_id),
+            worker.current_task_id.as_deref(),
+            &serde_json::json!({}),
+        )?;
+        self.service_get_worker(worker_id)?
+            .with_context(|| format!("service worker disappeared: {worker_id}"))
+    }
+
+    fn service_set_worker_status(
+        &self,
+        worker_id: &str,
+        status: &str,
+        event_type: &str,
+    ) -> Result<ServiceWorkerRecord> {
+        let worker = self
+            .service_get_worker(worker_id)?
+            .with_context(|| format!("service worker does not exist: {worker_id}"))?;
+        let status = normalized_worker_status(status)?;
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_workers
+	             SET status = ?1, last_heartbeat_at = ?2, updated_at = ?2
+	             WHERE id = ?3",
+            params![status, now, worker_id],
+        )?;
+        ensure_service_updated(updated, "worker", worker_id)?;
+        self.service_record_event(
+            event_type,
+            Some(worker_id),
+            worker.current_task_id.as_deref(),
+            &serde_json::json!({"status": status}),
+        )?;
+        self.service_get_worker(worker_id)?
+            .with_context(|| format!("service worker disappeared: {worker_id}"))
+    }
+
+    pub fn service_list_workers(&self) -> Result<Vec<ServiceWorkerRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, role, status, capacity, current_task_id, last_heartbeat_at,
+                    metadata, created_at, updated_at
+             FROM service_workers
+             ORDER BY id",
+        )?;
+        let records = stmt
+            .query_map([], map_service_worker_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(records)
+    }
+
+    pub fn service_get_worker(&self, worker_id: &str) -> Result<Option<ServiceWorkerRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, kind, role, status, capacity, current_task_id, last_heartbeat_at,
+                        metadata, created_at, updated_at
+                 FROM service_workers
+                 WHERE id = ?1",
+                [worker_id],
+                map_service_worker_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn service_create_task(&self, input: ServiceTaskInput) -> Result<ServiceTaskRecord> {
+        let title = required_service_field("task title", &input.title)?;
+        let description = required_service_field("task description", &input.description)?;
+        let source_prd_path = required_service_field("source PRD path", &input.source_prd_path)?;
+        let preferred_model = normalized_worker_kind(&input.preferred_model)?;
+        let role = required_service_field("task role", &input.role)?;
+        if input.acceptance_criteria.is_empty() {
+            anyhow::bail!("task acceptance criteria cannot be empty");
+        }
+        let max_attempts = input
+            .max_attempts
+            .unwrap_or(DEFAULT_SERVICE_TASK_MAX_ATTEMPTS);
+        if max_attempts < 1 {
+            anyhow::bail!("task max attempts must be positive");
+        }
+        let acceptance_criteria = input
+            .acceptance_criteria
+            .into_iter()
+            .map(|criterion| required_service_field("acceptance criterion", &criterion))
+            .collect::<Result<Vec<_>>>()?;
+        let dependencies = input
+            .dependencies
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dependency| required_service_field("task dependency", &dependency))
+            .collect::<Result<Vec<_>>>()?;
+        let scheduling =
+            service_task_scheduling_metadata(&preferred_model, &description, &acceptance_criteria);
+        let eligible_providers = normalize_service_provider_lane(Some(&scheduling.pool));
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = service_now();
+        self.conn.execute(
+            "INSERT INTO service_tasks (
+	                id, title, description, acceptance_criteria, source_prd_path,
+		                source_task_number, state, priority, preferred_model, role, parallelizable,
+			                dependencies, scheduling_pool, estimated_size, claude_suitable,
+			                assigned_worker_id, eligible_providers, lease_owner, lease_expires_at,
+			                claimed_at, completed_worker_id, completed_worker_kind, claim_duration_secs,
+			                retry_count, failure_reason, attempt, max_attempts,
+			                acked_at, started_at, reported_at, verified_at, completed_at, last_error,
+			                retry_reason, report_hash, created_at, updated_at
+			             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10,
+			                       ?11, ?12, ?13, ?14, NULL, ?15, NULL, NULL,
+			                       NULL, NULL, NULL, NULL, 0, NULL, 0, ?16,
+			                       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?17, ?17)",
+            params![
+                id,
+                title,
+                description,
+                serde_json::to_string(&acceptance_criteria)?,
+                source_prd_path,
+                input.source_task_number.as_deref(),
+                input.priority,
+                preferred_model,
+                role,
+                bool_to_i64(input.parallelizable),
+                serde_json::to_string(&dependencies)?,
+                scheduling.pool,
+                scheduling.size,
+                bool_to_i64(scheduling.claude_suitable),
+                eligible_providers,
+                max_attempts,
+                now
+            ],
+        )?;
+        self.service_record_event(
+            "task.created",
+            None,
+            Some(&id),
+            &serde_json::json!({"title": title, "preferred_model": preferred_model}),
+        )?;
+        self.service_get_task(&id)?
+            .with_context(|| format!("created service task disappeared: {id}"))
+    }
+
+    pub fn service_list_tasks(
+        &self,
+        state: Option<&str>,
+        worker_id: Option<&str>,
+    ) -> Result<Vec<ServiceTaskRecord>> {
+        let mut sql = format!("{} FROM service_tasks", service_task_select_clause());
+        let mut filters = Vec::new();
+        let mut params_vec = Vec::new();
+        if let Some(state) = state {
+            filters.push("state = ?");
+            params_vec.push(state.to_string());
+        }
+        if let Some(worker_id) = worker_id {
+            filters.push("assigned_worker_id = ?");
+            params_vec.push(worker_id.to_string());
+        }
+        if !filters.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filters.join(" AND "));
+        }
+        sql.push_str(" ORDER BY priority DESC, created_at, id");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let records = stmt
+            .query_map(params_from_iter(params_vec), map_service_task_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(records)
+    }
+
+    pub fn service_get_task(&self, task_id: &str) -> Result<Option<ServiceTaskRecord>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "{} FROM service_tasks WHERE id = ?1",
+                    service_task_select_clause()
+                ),
+                [task_id],
+                map_service_task_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn service_claim_next_task(
+        &self,
+        worker_id: &str,
+        lease_secs: i64,
+        lane_escape_secs: i64,
+    ) -> Result<Option<ServiceTaskRecord>> {
+        if lease_secs < 1 {
+            anyhow::bail!("lease_secs must be positive");
+        }
+        let worker = self
+            .service_get_worker(worker_id)?
+            .with_context(|| format!("service worker does not exist: {worker_id}"))?;
+        if !matches!(
+            worker.status.as_str(),
+            WORKER_STATE_READY | WORKER_STATE_ASSIGNED
+        ) {
+            anyhow::bail!("service worker {worker_id} is not ready to claim tasks");
+        }
+
+        for _ in 0..8 {
+            let mut candidates = self.service_claim_candidates(worker_id)?;
+            candidates.sort_by(|a, b| {
+                service_direct_claim_rank(&worker, a)
+                    .cmp(&service_direct_claim_rank(&worker, b))
+                    .then_with(|| b.priority.cmp(&a.priority))
+                    .then_with(|| {
+                        service_lane_claim_rank(&worker, a, lane_escape_secs)
+                            .cmp(&service_lane_claim_rank(&worker, b, lane_escape_secs))
+                    })
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            let Some(task) = candidates
+                .into_iter()
+                .filter(|task| {
+                    service_worker_can_claim_task(&worker, task, lane_escape_secs)
+                        && self.ensure_service_task_eligible(task).is_ok()
+                })
+                .next()
+            else {
+                return Ok(None);
+            };
+
+            let now = service_now();
+            let lease_expires_at = service_time_after_secs(lease_secs);
+            let update_result = if task.state == TASK_STATE_ASSIGNED {
+                self.conn.execute(
+                    "UPDATE service_tasks
+                     SET state = ?1,
+                         lease_owner = ?2,
+                         lease_expires_at = ?3,
+                         claimed_at = COALESCE(claimed_at, ?4),
+                         acked_at = COALESCE(acked_at, ?4),
+                         updated_at = ?4
+                     WHERE id = ?5 AND state = ?6 AND assigned_worker_id = ?2",
+                    params![
+                        TASK_STATE_ACKED,
+                        worker.id,
+                        lease_expires_at,
+                        now,
+                        task.id,
+                        TASK_STATE_ASSIGNED
+                    ],
+                )?
+            } else {
+                self.conn.execute(
+                    "UPDATE service_tasks
+                     SET state = ?1,
+                         assigned_worker_id = ?2,
+                         lease_owner = ?2,
+                         lease_expires_at = ?3,
+                         claimed_at = ?4,
+                         acked_at = ?4,
+                         updated_at = ?4
+                     WHERE id = ?5 AND state = ?6 AND assigned_worker_id IS NULL",
+                    params![
+                        TASK_STATE_ACKED,
+                        worker.id,
+                        lease_expires_at,
+                        now,
+                        task.id,
+                        TASK_STATE_QUEUED
+                    ],
+                )?
+            };
+
+            if update_result == 1 {
+                self.conn.execute(
+                    "UPDATE service_workers
+                     SET status = ?1, current_task_id = ?2, updated_at = ?3
+                     WHERE id = ?4",
+                    params![WORKER_STATE_WORKING, task.id, now, worker.id],
+                )?;
+                self.service_record_event(
+                    "task.claimed",
+                    Some(&worker.id),
+                    Some(&task.id),
+                    &serde_json::json!({
+                        "lease_expires_at": lease_expires_at,
+                        "eligible_providers": task.eligible_providers,
+                    }),
+                )?;
+                return self.service_get_task(&task.id);
+            }
+        }
+        Ok(None)
+    }
+
+    fn service_claim_candidates(&self, worker_id: &str) -> Result<Vec<ServiceTaskRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{} FROM service_tasks
+             WHERE (state = ?1 AND assigned_worker_id = ?2)
+                OR (state = ?3 AND assigned_worker_id IS NULL)
+             ORDER BY priority DESC, created_at, id",
+            service_task_select_clause()
+        ))?;
+        let records = stmt
+            .query_map(
+                params![TASK_STATE_ASSIGNED, worker_id, TASK_STATE_QUEUED],
+                map_service_task_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(records)
+    }
+
+    pub fn service_touch_task(
+        &self,
+        worker_id: &str,
+        task_id: &str,
+        lease_secs: i64,
+    ) -> Result<ServiceTaskRecord> {
+        if lease_secs < 1 {
+            anyhow::bail!("lease_secs must be positive");
+        }
+        let _worker = self
+            .service_get_worker(worker_id)?
+            .with_context(|| format!("service worker does not exist: {worker_id}"))?;
+        let now = service_now();
+        let lease_expires_at = service_time_after_secs(lease_secs);
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+             SET lease_expires_at = ?1, updated_at = ?2
+             WHERE id = ?3 AND lease_owner = ?4 AND state IN ('acked', 'working')",
+            params![lease_expires_at, now, task_id, worker_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("service task {task_id} is not leased by {worker_id}");
+        }
+        self.conn.execute(
+            "UPDATE service_workers SET last_heartbeat_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![now, worker_id],
+        )?;
+        self.service_record_event(
+            "task.lease_touched",
+            Some(worker_id),
+            Some(task_id),
+            &serde_json::json!({"lease_expires_at": lease_expires_at}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_reap_queue(&self, steal_after_secs: i64) -> Result<ServiceQueueReapResult> {
+        if steal_after_secs < 1 {
+            anyhow::bail!("steal_after_secs must be positive");
+        }
+        let now = chrono::Utc::now();
+        let timestamp = service_now();
+        let mut lease_expired = Vec::new();
+        let mut assignment_released = Vec::new();
+        let mut failed = Vec::new();
+
+        for task in self.service_list_tasks(None, None)? {
+            if matches!(task.state.as_str(), TASK_STATE_ACKED | TASK_STATE_WORKING) {
+                let expired = task
+                    .lease_expires_at
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|expires| expires.with_timezone(&chrono::Utc) <= now)
+                    .unwrap_or(false);
+                if !expired {
+                    continue;
+                }
+                let exhausted = task.attempt + 1 >= task.max_attempts;
+                if exhausted {
+                    self.conn.execute(
+                        "UPDATE service_tasks
+                         SET state = ?1,
+                             failure_reason = 'lease expired and max attempts exhausted',
+                             last_error = 'lease expired and max attempts exhausted',
+                             lease_owner = NULL,
+                             lease_expires_at = NULL,
+                             updated_at = ?2
+                         WHERE id = ?3",
+                        params![TASK_STATE_FAILED, timestamp, task.id],
+                    )?;
+                    failed.push(self.require_service_task(&task.id)?);
+                } else {
+                    self.conn.execute(
+                        "UPDATE service_tasks
+                         SET state = ?1,
+                             assigned_worker_id = NULL,
+                             lease_owner = NULL,
+                             lease_expires_at = NULL,
+                             retry_count = retry_count + 1,
+                             attempt = attempt + 1,
+                             retry_reason = 'lease expired',
+                             last_error = 'lease expired',
+                             updated_at = ?2
+                         WHERE id = ?3",
+                        params![TASK_STATE_QUEUED, timestamp, task.id],
+                    )?;
+                    lease_expired.push(self.require_service_task(&task.id)?);
+                }
+                if let Some(worker_id) = task.assigned_worker_id.as_deref() {
+                    self.conn.execute(
+                        "UPDATE service_workers
+                         SET status = ?1, current_task_id = NULL, updated_at = ?2
+                         WHERE id = ?3",
+                        params![WORKER_STATE_READY, timestamp, worker_id],
+                    )?;
+                }
+                self.service_record_event(
+                    "task.lease_expired",
+                    task.assigned_worker_id.as_deref(),
+                    Some(&task.id),
+                    &serde_json::json!({"failed": exhausted}),
+                )?;
+                continue;
+            }
+
+            if task.state == TASK_STATE_ASSIGNED {
+                let updated_at = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(now);
+                if now.signed_duration_since(updated_at).num_seconds() < steal_after_secs {
+                    continue;
+                }
+                let previous_worker = task.assigned_worker_id.clone();
+                self.conn.execute(
+                    "UPDATE service_tasks
+                     SET state = ?1,
+                         assigned_worker_id = NULL,
+                         retry_reason = 'direct assignment released',
+                         last_error = 'direct assignment released',
+                         updated_at = ?2
+                     WHERE id = ?3 AND state = ?4",
+                    params![TASK_STATE_QUEUED, timestamp, task.id, TASK_STATE_ASSIGNED],
+                )?;
+                if let Some(worker_id) = previous_worker.as_deref() {
+                    self.conn.execute(
+                        "UPDATE service_workers
+                         SET status = ?1, current_task_id = NULL, updated_at = ?2
+                         WHERE id = ?3",
+                        params![WORKER_STATE_READY, timestamp, worker_id],
+                    )?;
+                }
+                self.service_record_event(
+                    "task.assignment_released",
+                    previous_worker.as_deref(),
+                    Some(&task.id),
+                    &serde_json::json!({"steal_after_secs": steal_after_secs}),
+                )?;
+                assignment_released.push(self.require_service_task(&task.id)?);
+            }
+        }
+
+        Ok(ServiceQueueReapResult {
+            lease_expired,
+            assignment_released,
+            failed,
+        })
+    }
+
+    pub fn service_queue_stats(&self, window_secs: i64) -> Result<ServiceQueueStats> {
+        if window_secs < 1 {
+            anyhow::bail!("window_secs must be positive");
+        }
+        let now = chrono::Utc::now();
+        let mut lanes = BTreeMap::<String, (i64, Option<i64>)>::new();
+        let mut directly_assigned_queued = 0;
+        let mut total_queued = 0;
+        let mut total_in_flight = 0;
+
+        for task in self.service_list_tasks(None, None)? {
+            if task.state == TASK_STATE_QUEUED {
+                total_queued += 1;
+                if task.assigned_worker_id.is_some() {
+                    directly_assigned_queued += 1;
+                } else {
+                    let lane = task
+                        .eligible_providers
+                        .clone()
+                        .unwrap_or_else(|| "any".to_string());
+                    let age = chrono::DateTime::parse_from_rfc3339(&task.created_at)
+                        .ok()
+                        .map(|created| {
+                            now.signed_duration_since(created.with_timezone(&chrono::Utc))
+                                .num_seconds()
+                                .max(0)
+                        });
+                    let entry = lanes.entry(lane).or_insert((0, None));
+                    entry.0 += 1;
+                    entry.1 = match (entry.1, age) {
+                        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+                        (None, Some(candidate)) => Some(candidate),
+                        (current, None) => current,
+                    };
+                }
+            }
+            if matches!(task.state.as_str(), TASK_STATE_ACKED | TASK_STATE_WORKING) {
+                total_in_flight += 1;
+            }
+        }
+
+        let lanes = lanes
+            .into_iter()
+            .map(|(lane, (queued, oldest_age_secs))| ServiceQueueLaneStat {
+                lane,
+                queued,
+                oldest_age_secs,
+            })
+            .collect::<Vec<_>>();
+
+        let since = now
+            .checked_sub_signed(chrono::Duration::seconds(window_secs))
+            .unwrap_or(now);
+        let mut providers = BTreeMap::<String, (i64, i64, i64)>::new();
+        for task in self.service_list_tasks(None, None)? {
+            if matches!(task.state.as_str(), TASK_STATE_ACKED | TASK_STATE_WORKING) {
+                let kind = task
+                    .lease_owner
+                    .as_deref()
+                    .and_then(|worker_id| self.service_get_worker(worker_id).ok().flatten())
+                    .map(|worker| worker.kind)
+                    .unwrap_or_else(|| "unknown".to_string());
+                providers.entry(kind).or_insert((0, 0, 0)).0 += 1;
+            }
+            if task.state == TASK_STATE_COMPLETE {
+                let completed_at = task
+                    .completed_at
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                if completed_at.is_some_and(|completed| completed >= since) {
+                    let kind = task
+                        .completed_worker_kind
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let entry = providers.entry(kind).or_insert((0, 0, 0));
+                    entry.1 += 1;
+                    entry.2 += task.claim_duration_secs.unwrap_or(0);
+                }
+            }
+        }
+        let providers = providers
+            .into_iter()
+            .map(
+                |(worker_kind, (in_flight, completed_window, duration_sum))| {
+                    ServiceQueueProviderStat {
+                        worker_kind,
+                        in_flight,
+                        completed_window,
+                        avg_claim_duration_secs: if completed_window > 0 {
+                            Some(duration_sum as f64 / completed_window as f64)
+                        } else {
+                            None
+                        },
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let pool_sizing_hint = service_pool_sizing_hint(&providers);
+
+        Ok(ServiceQueueStats {
+            lanes,
+            directly_assigned_queued,
+            total_queued,
+            total_in_flight,
+            providers,
+            pool_sizing_hint,
+            window_secs,
+        })
+    }
+
+    pub fn service_assign_task(
+        &self,
+        task_id: &str,
+        worker_id: Option<&str>,
+    ) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if task.state != TASK_STATE_QUEUED {
+            anyhow::bail!(
+                "service task {task_id} cannot be assigned from state {}",
+                task.state
+            );
+        }
+        self.ensure_service_task_eligible(&task)?;
+        let worker = match worker_id {
+            Some(worker_id) => self
+                .service_get_worker(worker_id)?
+                .with_context(|| format!("service worker does not exist: {worker_id}"))?,
+            None => self
+                .service_list_workers()?
+                .into_iter()
+                .filter(|worker| service_worker_can_take_task(worker, &task))
+                .next()
+                .with_context(|| format!("no ready service worker for task {task_id}"))?,
+        };
+        if !service_worker_can_take_task(&worker, &task) {
+            anyhow::bail!(
+                "service worker {} cannot take task {} in pool {}",
+                worker.id,
+                task.id,
+                task.scheduling_pool
+            );
+        }
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+	             SET state = ?1, assigned_worker_id = ?2, updated_at = ?3
+	             WHERE id = ?4 AND state = ?5",
+            params![
+                TASK_STATE_ASSIGNED,
+                worker.id,
+                now,
+                task_id,
+                TASK_STATE_QUEUED
+            ],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.conn.execute(
+            "UPDATE service_workers
+	             SET status = ?1, current_task_id = ?2, updated_at = ?3
+	             WHERE id = ?4",
+            params![WORKER_STATE_ASSIGNED, task_id, now, worker.id],
+        )?;
+        self.service_record_event(
+            "task.assigned",
+            Some(&worker.id),
+            Some(task_id),
+            &serde_json::json!({"worker_id": worker.id}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_ack_task(&self, task_id: &str) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if task.state != TASK_STATE_ASSIGNED {
+            anyhow::bail!(
+                "service task {task_id} cannot be acked from state {}",
+                task.state
+            );
+        }
+        let worker_id = task
+            .assigned_worker_id
+            .as_deref()
+            .context("assigned task has no worker")?;
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+	             SET state = ?1, acked_at = ?2, updated_at = ?2
+	             WHERE id = ?3 AND state = ?4",
+            params![TASK_STATE_ACKED, now, task_id, TASK_STATE_ASSIGNED],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.conn.execute(
+            "UPDATE service_workers SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![WORKER_STATE_WORKING, now, worker_id],
+        )?;
+        self.service_record_event(
+            "task.acked",
+            Some(worker_id),
+            Some(task_id),
+            &serde_json::json!({}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_start_task(&self, task_id: &str) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if task.state != TASK_STATE_ACKED {
+            anyhow::bail!(
+                "service task {task_id} cannot be started from state {}",
+                task.state
+            );
+        }
+        let worker_id = task
+            .assigned_worker_id
+            .as_deref()
+            .context("acked task has no worker")?;
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+	             SET state = ?1, started_at = ?2, updated_at = ?2
+	             WHERE id = ?3 AND state = ?4",
+            params![TASK_STATE_WORKING, now, task_id, TASK_STATE_ACKED],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.conn.execute(
+            "UPDATE service_workers SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![WORKER_STATE_WORKING, now, worker_id],
+        )?;
+        self.service_record_event(
+            "task.working",
+            Some(worker_id),
+            Some(task_id),
+            &serde_json::json!({}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_progress_task(
+        &self,
+        task_id: &str,
+        input: ServiceTaskProgressInput,
+    ) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if !matches!(task.state.as_str(), TASK_STATE_ACKED | TASK_STATE_WORKING) {
+            anyhow::bail!(
+                "service task {task_id} cannot record progress from state {}",
+                task.state
+            );
+        }
+        let summary =
+            redact_report_text(&required_service_field("progress summary", &input.summary)?);
+        self.service_record_event(
+            "task.progress",
+            task.assigned_worker_id.as_deref(),
+            Some(task_id),
+            &serde_json::json!({"summary": summary}),
+        )?;
+        Ok(task)
+    }
+
+    pub fn service_report_task(
+        &self,
+        task_id: &str,
+        input: ServiceTaskReportInput,
+    ) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if !matches!(task.state.as_str(), TASK_STATE_ACKED | TASK_STATE_WORKING) {
+            anyhow::bail!(
+                "service task {task_id} cannot be reported from state {}",
+                task.state
+            );
+        }
+        let report = ServiceTaskReportInput {
+            summary: redact_report_text(&required_service_field("report summary", &input.summary)?),
+            files_inspected: redact_report_list(input.files_inspected),
+            changed_files: redact_report_list(input.changed_files),
+            tests_run: redact_report_list(input.tests_run),
+            verification: redact_report_text(&required_service_field(
+                "report verification",
+                &input.verification,
+            )?),
+            risks: redact_report_text(&input.risks),
+            raw_report: redact_report_text(&input.raw_report),
+        };
+        let report_hash = service_report_hash(&report)?;
+        let now = service_now();
+        self.conn.execute(
+            "INSERT INTO service_task_reports (
+                task_id, summary, files_inspected, changed_files, tests_run,
+                verification, risks, raw_report, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(task_id) DO UPDATE SET
+                summary = excluded.summary,
+                files_inspected = excluded.files_inspected,
+                changed_files = excluded.changed_files,
+                tests_run = excluded.tests_run,
+                verification = excluded.verification,
+                risks = excluded.risks,
+                raw_report = excluded.raw_report,
+                created_at = excluded.created_at",
+            params![
+                task_id,
+                report.summary,
+                serde_json::to_string(&report.files_inspected)?,
+                serde_json::to_string(&report.changed_files)?,
+                serde_json::to_string(&report.tests_run)?,
+                report.verification,
+                report.risks,
+                report.raw_report,
+                now
+            ],
+        )?;
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+	             SET state = ?1, reported_at = ?2, report_hash = ?3, updated_at = ?2
+	             WHERE id = ?4",
+            params![TASK_STATE_REPORTED, now, report_hash, task_id],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.service_record_event(
+            "task.reported",
+            task.assigned_worker_id.as_deref(),
+            Some(task_id),
+            &serde_json::json!({"report_hash": report_hash}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_verify_task(
+        &self,
+        task_id: &str,
+        input: ServiceTaskProgressInput,
+    ) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if task.state != TASK_STATE_REPORTED {
+            anyhow::bail!(
+                "service task {task_id} cannot be verified from state {}",
+                task.state
+            );
+        }
+        let summary = redact_report_text(&required_service_field(
+            "verification summary",
+            &input.summary,
+        )?);
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+	             SET state = ?1, verified_at = ?2, updated_at = ?2
+	             WHERE id = ?3 AND state = ?4",
+            params![TASK_STATE_VERIFIED, now, task_id, TASK_STATE_REPORTED],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.service_record_event(
+            "task.verified",
+            task.assigned_worker_id.as_deref(),
+            Some(task_id),
+            &serde_json::json!({"summary": summary}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_complete_task(&self, task_id: &str) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if !matches!(
+            task.state.as_str(),
+            TASK_STATE_REPORTED | TASK_STATE_VERIFIED
+        ) {
+            anyhow::bail!(
+                "service task {task_id} cannot be completed from state {}",
+                task.state
+            );
+        }
+        let report = self
+            .service_get_task_report(task_id)?
+            .with_context(|| format!("service task {task_id} has no report"))?;
+        if report.verification.trim().is_empty() {
+            anyhow::bail!("service task {task_id} cannot complete without verification evidence");
+        }
+        let now = service_now();
+        let claim_duration_secs = task
+            .claimed_at
+            .as_deref()
+            .and_then(service_elapsed_secs_since);
+        let completed_worker_kind = task
+            .assigned_worker_id
+            .as_deref()
+            .and_then(|worker_id| self.service_get_worker(worker_id).ok().flatten())
+            .map(|worker| worker.kind);
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+		             SET state = ?1,
+                         completed_at = ?2,
+                         completed_worker_id = ?3,
+                         completed_worker_kind = ?4,
+                         claim_duration_secs = ?5,
+                         lease_owner = NULL,
+                         lease_expires_at = NULL,
+                         updated_at = ?2
+		             WHERE id = ?6 AND state IN ('reported', 'verified')",
+            params![
+                TASK_STATE_COMPLETE,
+                now,
+                task.assigned_worker_id.as_deref(),
+                completed_worker_kind.as_deref(),
+                claim_duration_secs,
+                task_id
+            ],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        if let Some(worker_id) = task.assigned_worker_id.as_deref() {
+            self.conn.execute(
+                "UPDATE service_workers
+	                 SET status = ?1, current_task_id = NULL, updated_at = ?2
+	                 WHERE id = ?3",
+                params![WORKER_STATE_READY, now, worker_id],
+            )?;
+        }
+        self.service_record_event(
+            "task.completed",
+            task.assigned_worker_id.as_deref(),
+            Some(task_id),
+            &serde_json::json!({}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_fail_task(
+        &self,
+        task_id: &str,
+        blocked: bool,
+        reason: &str,
+    ) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if matches!(
+            task.state.as_str(),
+            TASK_STATE_COMPLETE | TASK_STATE_FAILED | TASK_STATE_BLOCKED
+        ) {
+            anyhow::bail!(
+                "service task {task_id} cannot fail from state {}",
+                task.state
+            );
+        }
+        let reason = required_service_field("failure reason", reason)?;
+        let new_state = if blocked {
+            TASK_STATE_BLOCKED
+        } else {
+            TASK_STATE_FAILED
+        };
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+	             SET state = ?1,
+	                 failure_reason = ?2,
+	                 retry_count = retry_count + 1,
+	                 attempt = attempt + 1,
+	                 last_error = ?2,
+	                 updated_at = ?3
+	             WHERE id = ?4",
+            params![new_state, reason, now, task_id],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        if let Some(worker_id) = task.assigned_worker_id.as_deref() {
+            self.conn.execute(
+                "UPDATE service_workers
+	                 SET status = ?1, current_task_id = NULL, updated_at = ?2
+	                 WHERE id = ?3",
+                params![WORKER_STATE_READY, now, worker_id],
+            )?;
+        }
+        self.service_record_event(
+            if blocked {
+                "task.blocked"
+            } else {
+                "task.failed"
+            },
+            task.assigned_worker_id.as_deref(),
+            Some(task_id),
+            &serde_json::json!({"reason": reason}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_retry_task(&self, task_id: &str, reason: &str) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if task.state == TASK_STATE_COMPLETE {
+            anyhow::bail!("service task {task_id} cannot retry from state complete");
+        }
+        if task.attempt >= task.max_attempts {
+            anyhow::bail!(
+                "service task {task_id} exceeded max attempts {}",
+                task.max_attempts
+            );
+        }
+        let reason = redact_report_text(&required_service_field("retry reason", reason)?);
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+	             SET state = ?1,
+	                 assigned_worker_id = NULL,
+	                 retry_count = retry_count + 1,
+	                 attempt = attempt + 1,
+	                 retry_reason = ?2,
+	                 last_error = ?2,
+	                 updated_at = ?3
+	             WHERE id = ?4",
+            params![TASK_STATE_QUEUED, reason, now, task_id],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        if let Some(worker_id) = task.assigned_worker_id.as_deref() {
+            self.conn.execute(
+                "UPDATE service_workers
+	                 SET status = ?1, current_task_id = NULL, updated_at = ?2
+	                 WHERE id = ?3",
+                params![WORKER_STATE_READY, now, worker_id],
+            )?;
+        }
+        self.service_record_event(
+            "task.retry",
+            task.assigned_worker_id.as_deref(),
+            Some(task_id),
+            &serde_json::json!({"reason": reason}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    pub fn service_requeue_stale_tasks(
+        &self,
+        stale_after_secs: i64,
+    ) -> Result<ServiceStaleRequeueResult> {
+        if stale_after_secs < 1 {
+            anyhow::bail!("stale_after_secs must be positive");
+        }
+        let now = chrono::Utc::now();
+        let mut requeued = Vec::new();
+        for task in self.service_list_tasks(None, None)? {
+            if !matches!(task.state.as_str(), TASK_STATE_ASSIGNED | TASK_STATE_ACKED) {
+                continue;
+            }
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
+            if now.signed_duration_since(updated_at).num_seconds() < stale_after_secs {
+                continue;
+            }
+            let timestamp = service_now();
+            if task.attempt >= task.max_attempts {
+                self.conn.execute(
+                    "UPDATE service_tasks
+	                     SET state = ?1,
+	                         failure_reason = 'stale assignment exceeded max attempts',
+	                         last_error = 'stale assignment exceeded max attempts',
+	                         updated_at = ?2
+	                     WHERE id = ?3",
+                    params![TASK_STATE_FAILED, timestamp, task.id],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE service_tasks
+	                     SET state = ?1,
+	                         assigned_worker_id = NULL,
+	                         retry_count = retry_count + 1,
+	                         attempt = attempt + 1,
+	                         failure_reason = 'stale assignment requeued',
+	                         retry_reason = 'stale assignment requeued',
+	                         last_error = 'stale assignment requeued',
+	                         updated_at = ?2
+	                     WHERE id = ?3 AND state IN ('assigned', 'acked')",
+                    params![TASK_STATE_QUEUED, timestamp, task.id],
+                )?;
+            }
+            if let Some(worker_id) = task.assigned_worker_id.as_deref() {
+                self.conn.execute(
+                    "UPDATE service_workers
+	                     SET status = ?1, current_task_id = NULL, updated_at = ?2
+	                     WHERE id = ?3",
+                    params![WORKER_STATE_READY, timestamp, worker_id],
+                )?;
+            }
+            self.service_record_event(
+                "task.assignment_timeout",
+                task.assigned_worker_id.as_deref(),
+                Some(&task.id),
+                &serde_json::json!({"stale_after_secs": stale_after_secs}),
+            )?;
+            requeued.push(self.require_service_task(&task.id)?);
+        }
+        Ok(ServiceStaleRequeueResult { requeued })
+    }
+
+    pub fn service_expire_stale_workers(
+        &self,
+        stale_after_secs: i64,
+    ) -> Result<ServiceStaleWorkerResult> {
+        if stale_after_secs < 1 {
+            anyhow::bail!("stale_after_secs must be positive");
+        }
+        let now = chrono::Utc::now();
+        let mut offline_workers = Vec::new();
+        let mut requeued = Vec::new();
+        for worker in self.service_list_workers()? {
+            if worker.status == WORKER_STATE_OFFLINE {
+                continue;
+            }
+            let Some(last_heartbeat_at) = worker.last_heartbeat_at.as_deref() else {
+                continue;
+            };
+            let heartbeat_at = chrono::DateTime::parse_from_rfc3339(last_heartbeat_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
+            if now.signed_duration_since(heartbeat_at).num_seconds() < stale_after_secs {
+                continue;
+            }
+            let timestamp = service_now();
+            self.conn.execute(
+                "UPDATE service_workers
+	                 SET status = ?1, current_task_id = NULL, updated_at = ?2
+	                 WHERE id = ?3",
+                params![WORKER_STATE_OFFLINE, timestamp, worker.id],
+            )?;
+            self.service_record_event(
+                "worker.offline",
+                Some(&worker.id),
+                worker.current_task_id.as_deref(),
+                &serde_json::json!({"stale_after_secs": stale_after_secs}),
+            )?;
+            if let Some(task_id) = worker.current_task_id.as_deref() {
+                if let Some(task) = self.service_get_task(task_id)? {
+                    if matches!(
+                        task.state.as_str(),
+                        TASK_STATE_ASSIGNED | TASK_STATE_ACKED | TASK_STATE_WORKING
+                    ) {
+                        if task.attempt >= task.max_attempts {
+                            self.conn.execute(
+	                                "UPDATE service_tasks
+	                                 SET state = ?1,
+	                                     failure_reason = 'stale worker heartbeat exceeded max attempts',
+	                                     last_error = 'stale worker heartbeat exceeded max attempts',
+	                                     updated_at = ?2
+	                                 WHERE id = ?3",
+	                                params![TASK_STATE_FAILED, timestamp, task_id],
+	                            )?;
+                            continue;
+                        }
+                        self.conn.execute(
+                            "UPDATE service_tasks
+	                             SET state = ?1,
+	                                 assigned_worker_id = NULL,
+	                                 retry_count = retry_count + 1,
+	                                 attempt = attempt + 1,
+	                                 failure_reason = 'stale worker heartbeat',
+	                                 retry_reason = 'stale worker heartbeat',
+	                                 last_error = 'stale worker heartbeat',
+	                                 updated_at = ?2
+	                             WHERE id = ?3",
+                            params![TASK_STATE_QUEUED, timestamp, task_id],
+                        )?;
+                        self.service_record_event(
+                            "task.retry",
+                            Some(&worker.id),
+                            Some(task_id),
+                            &serde_json::json!({"reason": "stale worker heartbeat"}),
+                        )?;
+                        requeued.push(self.require_service_task(task_id)?);
+                    }
+                }
+            }
+            offline_workers.push(
+                self.service_get_worker(&worker.id)?
+                    .with_context(|| format!("service worker disappeared: {}", worker.id))?,
+            );
+        }
+        Ok(ServiceStaleWorkerResult {
+            offline_workers,
+            requeued,
+        })
+    }
+
+    pub fn service_get_task_report(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<ServiceTaskReportRecord>> {
+        self.conn
+            .query_row(
+                "SELECT task_id, summary, files_inspected, changed_files, tests_run,
+                        verification, risks, raw_report, created_at
+                 FROM service_task_reports
+                 WHERE task_id = ?1",
+                [task_id],
+                map_service_task_report_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn service_list_events(
+        &self,
+        task_id: Option<&str>,
+        worker_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ServiceEventRecord>> {
+        let limit = limit.clamp(1, 500);
+        let mut sql =
+            "SELECT id, type, worker_id, task_id, payload, created_at FROM service_events"
+                .to_string();
+        let mut filters = Vec::new();
+        let mut params_vec = Vec::new();
+        if let Some(task_id) = task_id {
+            filters.push("task_id = ?");
+            params_vec.push(task_id.to_string());
+        }
+        if let Some(worker_id) = worker_id {
+            filters.push("worker_id = ?");
+            params_vec.push(worker_id.to_string());
+        }
+        if !filters.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filters.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+        params_vec.push(limit.to_string());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let records = stmt
+            .query_map(params_from_iter(params_vec), map_service_event_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(records)
+    }
+
+    pub fn service_import_prd(&self, path: &Path) -> Result<ServicePrdRecord> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read PRD file: {}", path.display()))?;
+        let title = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("# "))
+            .unwrap_or("Imported PRD")
+            .trim()
+            .to_string();
+        let canonical_path = path.to_string_lossy().to_string();
+        let prd_id = uuid::Uuid::new_v4().to_string();
+        let now = service_now();
+        self.conn.execute(
+            "INSERT INTO service_prds (id, path, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(path) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at",
+            params![prd_id, canonical_path, title, now],
+        )?;
+        let prd = self
+            .service_get_prd_by_path(&canonical_path)?
+            .with_context(|| format!("service PRD import failed: {canonical_path}"))?;
+        for parsed in parse_prd_checkbox_tasks(&canonical_path, &content) {
+            let _ = self.service_create_task(parsed)?;
+        }
+        self.service_record_event(
+            "prd.imported",
+            None,
+            None,
+            &serde_json::json!({"path": canonical_path}),
+        )?;
+        Ok(prd)
+    }
+
+    pub fn service_list_prds(&self) -> Result<Vec<ServicePrdRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, title, created_at, updated_at
+             FROM service_prds
+             ORDER BY updated_at DESC, path",
+        )?;
+        let records = stmt
+            .query_map([], map_service_prd_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(records)
+    }
+
+    pub fn service_get_prd_by_path(&self, path: &str) -> Result<Option<ServicePrdRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, path, title, created_at, updated_at
+                 FROM service_prds
+                 WHERE path = ?1",
+                [path],
+                map_service_prd_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn service_prd_tasks(&self, prd_path: &str) -> Result<Vec<ServiceTaskRecord>> {
+        self.service_list_tasks(None, None).map(|tasks| {
+            tasks
+                .into_iter()
+                .filter(|task| task.source_prd_path == prd_path)
+                .collect()
+        })
+    }
+
+    pub fn service_sync_prd(&self, path: &Path) -> Result<usize> {
+        let path_text = path.to_string_lossy().to_string();
+        let tasks = self.service_prd_tasks(&path_text)?;
+        let completed_numbers = tasks
+            .into_iter()
+            .filter(|task| task.state == "complete")
+            .filter_map(|task| task.source_task_number)
+            .collect::<std::collections::BTreeSet<_>>();
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read PRD file: {}", path.display()))?;
+        let mut changed = 0usize;
+        let updated = content
+            .lines()
+            .map(|line| {
+                if let Some(number) = checkbox_task_number(line) {
+                    if completed_numbers.contains(&number) && line.contains("[ ]") {
+                        changed += 1;
+                        return line.replacen("[ ]", "[x]", 1);
+                    }
+                }
+                line.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if changed > 0 {
+            fs::write(path, format!("{updated}\n"))
+                .with_context(|| format!("failed to write PRD file: {}", path.display()))?;
+        }
+        Ok(changed)
+    }
+
+    fn require_service_task(&self, task_id: &str) -> Result<ServiceTaskRecord> {
+        self.service_get_task(task_id)?
+            .with_context(|| format!("service task does not exist: {task_id}"))
+    }
+
+    fn ensure_service_task_eligible(&self, task: &ServiceTaskRecord) -> Result<()> {
+        for dependency_id in &task.dependencies {
+            let dependency = self.service_get_task(dependency_id)?.with_context(|| {
+                format!("service task dependency does not exist: {dependency_id}")
+            })?;
+            if dependency.state != TASK_STATE_COMPLETE {
+                anyhow::bail!(
+                    "service task {} is blocked by incomplete dependency {}",
+                    task.id,
+                    dependency_id
+                );
+            }
+        }
+        if !task.parallelizable {
+            for candidate in self.service_list_tasks(None, None)? {
+                if candidate.id == task.id
+                    || candidate.source_prd_path != task.source_prd_path
+                    || candidate.state == TASK_STATE_COMPLETE
+                {
+                    continue;
+                }
+                let Some(candidate_number) = candidate
+                    .source_task_number
+                    .as_deref()
+                    .and_then(|value| value.parse::<i64>().ok())
+                else {
+                    continue;
+                };
+                let Some(task_number) = task
+                    .source_task_number
+                    .as_deref()
+                    .and_then(|value| value.parse::<i64>().ok())
+                else {
+                    continue;
+                };
+                if candidate_number < task_number {
+                    anyhow::bail!(
+                        "service task {} is blocked by earlier serial task {}",
+                        task.id,
+                        candidate.id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn service_record_event(
+        &self,
+        event_type: &str,
+        worker_id: Option<&str>,
+        task_id: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO service_events (id, type, worker_id, task_id, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                event_type,
+                worker_id,
+                task_id,
+                payload.to_string(),
+                service_now()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Return archived agents that still have pending tasks (queued or acked).
     /// Each entry is (agent_id, vec_of_task_ids), sorted by agent_id.
     pub fn archived_agents_with_pending_tasks(&self) -> Result<Vec<(String, Vec<String>)>> {
@@ -1805,6 +3637,438 @@ fn map_task_row(row: &rusqlite::Row) -> rusqlite::Result<TaskRecord> {
         updated_at: row.get(10)?,
         completed_at: row.get(11)?,
     })
+}
+
+fn map_service_worker_row(row: &rusqlite::Row) -> rusqlite::Result<ServiceWorkerRecord> {
+    Ok(ServiceWorkerRecord {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        role: row.get(2)?,
+        status: row.get(3)?,
+        capacity: row.get(4)?,
+        current_task_id: row.get(5)?,
+        last_heartbeat_at: row.get(6)?,
+        metadata: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn map_service_task_row(row: &rusqlite::Row) -> rusqlite::Result<ServiceTaskRecord> {
+    let acceptance_criteria_json: String = row.get(3)?;
+    let acceptance_criteria = serde_json::from_str(&acceptance_criteria_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let parallelizable: i64 = row.get(10)?;
+    let dependencies_json: String = row.get(11)?;
+    let dependencies = serde_json::from_str(&dependencies_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let claude_suitable: i64 = row.get(14)?;
+    Ok(ServiceTaskRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        acceptance_criteria,
+        source_prd_path: row.get(4)?,
+        source_task_number: row.get(5)?,
+        state: row.get(6)?,
+        priority: row.get(7)?,
+        preferred_model: row.get(8)?,
+        role: row.get(9)?,
+        parallelizable: parallelizable != 0,
+        dependencies,
+        scheduling_pool: row.get(12)?,
+        estimated_size: row.get(13)?,
+        claude_suitable: claude_suitable != 0,
+        assigned_worker_id: row.get(15)?,
+        eligible_providers: row.get(16)?,
+        lease_owner: row.get(17)?,
+        lease_expires_at: row.get(18)?,
+        claimed_at: row.get(19)?,
+        completed_worker_id: row.get(20)?,
+        completed_worker_kind: row.get(21)?,
+        claim_duration_secs: row.get(22)?,
+        retry_count: row.get(23)?,
+        failure_reason: row.get(24)?,
+        attempt: row.get(25)?,
+        max_attempts: row.get(26)?,
+        acked_at: row.get(27)?,
+        started_at: row.get(28)?,
+        reported_at: row.get(29)?,
+        verified_at: row.get(30)?,
+        completed_at: row.get(31)?,
+        last_error: row.get(32)?,
+        retry_reason: row.get(33)?,
+        report_hash: row.get(34)?,
+        created_at: row.get(35)?,
+        updated_at: row.get(36)?,
+    })
+}
+
+fn map_service_task_report_row(row: &rusqlite::Row) -> rusqlite::Result<ServiceTaskReportRecord> {
+    let files_inspected_json: String = row.get(2)?;
+    let changed_files_json: String = row.get(3)?;
+    let tests_run_json: String = row.get(4)?;
+    let files_inspected = serde_json::from_str(&files_inspected_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let changed_files = serde_json::from_str(&changed_files_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let tests_run = serde_json::from_str(&tests_run_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ServiceTaskReportRecord {
+        task_id: row.get(0)?,
+        summary: row.get(1)?,
+        files_inspected,
+        changed_files,
+        tests_run,
+        verification: row.get(5)?,
+        risks: row.get(6)?,
+        raw_report: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+fn map_service_prd_row(row: &rusqlite::Row) -> rusqlite::Result<ServicePrdRecord> {
+    Ok(ServicePrdRecord {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        title: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn map_service_event_row(row: &rusqlite::Row) -> rusqlite::Result<ServiceEventRecord> {
+    Ok(ServiceEventRecord {
+        id: row.get(0)?,
+        event_type: row.get(1)?,
+        worker_id: row.get(2)?,
+        task_id: row.get(3)?,
+        payload: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+fn service_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn service_task_select_clause() -> &'static str {
+    "SELECT id, title, description, acceptance_criteria, source_prd_path,
+            source_task_number, state, priority, preferred_model, role,
+            parallelizable, dependencies, scheduling_pool, estimated_size, claude_suitable,
+            assigned_worker_id, eligible_providers, lease_owner, lease_expires_at,
+            claimed_at, completed_worker_id, completed_worker_kind, claim_duration_secs,
+            retry_count, failure_reason,
+            attempt, max_attempts, acked_at, started_at, reported_at, verified_at,
+            completed_at, last_error, retry_reason, report_hash, created_at, updated_at"
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn required_service_field(field: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("service {field} cannot be empty");
+    }
+    Ok(value.to_string())
+}
+
+fn normalized_worker_kind(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "codex" | "claude" | "openrouter" | "local" | "manual" => Ok(value),
+        _ => anyhow::bail!(
+            "invalid service worker kind '{value}'. Expected codex, claude, openrouter, local, or manual"
+        ),
+    }
+}
+
+fn normalized_worker_status(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        WORKER_STATE_STARTING
+        | WORKER_STATE_READY
+        | WORKER_STATE_ASSIGNED
+        | WORKER_STATE_WORKING
+        | WORKER_STATE_BLOCKED
+        | WORKER_STATE_OFFLINE => Ok(value),
+        _ => anyhow::bail!(
+            "invalid service worker status '{value}'. Expected starting, ready, assigned, working, blocked, or offline"
+        ),
+    }
+}
+
+fn service_direct_claim_rank(worker: &ServiceWorkerRecord, task: &ServiceTaskRecord) -> i64 {
+    if task.assigned_worker_id.as_deref() == Some(worker.id.as_str()) {
+        0
+    } else {
+        1
+    }
+}
+
+fn service_lane_claim_rank(
+    worker: &ServiceWorkerRecord,
+    task: &ServiceTaskRecord,
+    lane_escape_secs: i64,
+) -> i64 {
+    if task.assigned_worker_id.as_deref() == Some(worker.id.as_str()) {
+        return 0;
+    }
+    if service_lane_explicitly_matches_worker(worker, task) {
+        return 1;
+    }
+    if task.eligible_providers.is_none() {
+        return 2;
+    }
+    if service_task_lane_escaped(task, lane_escape_secs) {
+        return 3;
+    }
+    9
+}
+
+fn service_worker_can_claim_task(
+    worker: &ServiceWorkerRecord,
+    task: &ServiceTaskRecord,
+    lane_escape_secs: i64,
+) -> bool {
+    if task.assigned_worker_id.as_deref() == Some(worker.id.as_str()) {
+        return worker
+            .current_task_id
+            .as_deref()
+            .is_none_or(|id| id == task.id)
+            && matches!(
+                worker.status.as_str(),
+                WORKER_STATE_READY | WORKER_STATE_ASSIGNED
+            );
+    }
+    if worker.status != WORKER_STATE_READY || worker.current_task_id.is_some() {
+        return false;
+    }
+    if !worker.role.eq_ignore_ascii_case(&task.role) && worker.role != "coding_worker" {
+        return false;
+    }
+    service_lane_matches_worker(worker, task) || service_task_lane_escaped(task, lane_escape_secs)
+}
+
+fn service_lane_matches_worker(worker: &ServiceWorkerRecord, task: &ServiceTaskRecord) -> bool {
+    task.eligible_providers.is_none() || service_lane_explicitly_matches_worker(worker, task)
+}
+
+fn service_lane_explicitly_matches_worker(
+    worker: &ServiceWorkerRecord,
+    task: &ServiceTaskRecord,
+) -> bool {
+    let Some(lane) = task.eligible_providers.as_deref() else {
+        return false;
+    };
+    lane.split(',')
+        .map(str::trim)
+        .any(|provider| provider == worker.kind)
+}
+
+fn service_task_lane_escaped(task: &ServiceTaskRecord, lane_escape_secs: i64) -> bool {
+    if task.eligible_providers.is_none() {
+        return true;
+    }
+    let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(&task.created_at) else {
+        return false;
+    };
+    chrono::Utc::now()
+        .signed_duration_since(created_at.with_timezone(&chrono::Utc))
+        .num_seconds()
+        >= lane_escape_secs.max(0)
+}
+
+fn service_time_after_secs(secs: i64) -> String {
+    chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(secs.max(1)))
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn service_elapsed_secs_since(value: &str) -> Option<i64> {
+    let started = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+    Some(
+        chrono::Utc::now()
+            .signed_duration_since(started.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .max(0),
+    )
+}
+
+fn service_pool_sizing_hint(providers: &[ServiceQueueProviderStat]) -> Option<String> {
+    let mut rates = providers
+        .iter()
+        .filter(|provider| provider.completed_window > 0)
+        .map(|provider| {
+            (
+                provider.worker_kind.as_str(),
+                provider.completed_window as f64,
+            )
+        })
+        .collect::<Vec<_>>();
+    if rates.len() < 2 {
+        return None;
+    }
+    rates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (fast_kind, fast_count) = rates[0];
+    let (slow_kind, slow_count) = rates[rates.len() - 1];
+    if slow_count <= 0.0 {
+        return None;
+    }
+    Some(format!(
+        "{fast_kind} is completing {:.1}x more tasks than {slow_kind}; size worker pools accordingly.",
+        fast_count / slow_count
+    ))
+}
+
+fn service_worker_can_take_task(worker: &ServiceWorkerRecord, task: &ServiceTaskRecord) -> bool {
+    if worker.status != WORKER_STATE_READY || worker.current_task_id.is_some() {
+        return false;
+    }
+    if !worker.role.eq_ignore_ascii_case(&task.role) && worker.role != "coding_worker" {
+        return false;
+    }
+    match task.scheduling_pool.as_str() {
+        "manual" => worker.kind == "manual",
+        "claude" => worker.kind == "claude" && task.claude_suitable,
+        "codex" => worker.kind == "codex",
+        "openrouter" => worker.kind == "openrouter",
+        "local" => worker.kind == "local",
+        preferred => worker.kind == preferred,
+    }
+}
+
+struct ServiceTaskScheduling {
+    pool: String,
+    size: String,
+    claude_suitable: bool,
+}
+
+fn service_task_scheduling_metadata(
+    preferred_model: &str,
+    description: &str,
+    acceptance_criteria: &[String],
+) -> ServiceTaskScheduling {
+    let weighted_size =
+        description.len() + acceptance_criteria.iter().map(String::len).sum::<usize>();
+    let size = if weighted_size <= 800 && acceptance_criteria.len() <= 3 {
+        "small"
+    } else if weighted_size <= 1800 && acceptance_criteria.len() <= 5 {
+        "medium"
+    } else {
+        "large"
+    };
+    let claude_suitable = preferred_model == "claude" && size == "small";
+    let pool = match preferred_model {
+        "claude" if claude_suitable => "claude",
+        "claude" => "codex",
+        other => other,
+    };
+    ServiceTaskScheduling {
+        pool: pool.to_string(),
+        size: size.to_string(),
+        claude_suitable,
+    }
+}
+
+fn ensure_service_updated(updated: usize, kind: &str, id: &str) -> Result<()> {
+    if updated == 1 {
+        Ok(())
+    } else {
+        anyhow::bail!("stale service {kind} state for {id}")
+    }
+}
+
+fn redact_report_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| redact_report_text(&value))
+        .collect()
+}
+
+fn redact_report_text(value: &str) -> String {
+    let mut redacted = value.to_string();
+    for pattern in [
+        r#"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['"]?[^'"\s]+"#,
+        r"sk-[A-Za-z0-9_\-]{12,}",
+        r"or-[A-Za-z0-9_\-]{12,}",
+        r"/Users/[A-Za-z0-9._-]+",
+    ] {
+        let regex = regex::Regex::new(pattern).expect("valid redaction regex");
+        redacted = regex.replace_all(&redacted, "[REDACTED]").to_string();
+    }
+    redacted
+}
+
+fn service_report_hash(report: &ServiceTaskReportInput) -> Result<String> {
+    let canonical = serde_json::to_vec(report)?;
+    let digest = Sha256::digest(canonical);
+    Ok(format!("sha256:{:x}", digest))
+}
+
+fn parse_prd_checkbox_tasks(source_prd_path: &str, content: &str) -> Vec<ServiceTaskInput> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let number = checkbox_task_number(line)?;
+            let after_checkbox = line.split_once(']')?.1.trim();
+            let title = after_checkbox
+                .trim_start_matches(|ch: char| ch == '.' || ch == '-' || ch.is_ascii_digit())
+                .trim()
+                .trim_end_matches("- Parallel")
+                .trim_end_matches("- Serial")
+                .trim()
+                .to_string();
+            if title.is_empty() {
+                return None;
+            }
+            Some(ServiceTaskInput {
+                title: title.clone(),
+                description: title,
+                acceptance_criteria: vec!["Task is implemented, tested, and reported.".to_string()],
+                source_prd_path: source_prd_path.to_string(),
+                source_task_number: Some(number),
+                priority: 0,
+                preferred_model: "codex".to_string(),
+                role: "coding_worker".to_string(),
+                parallelizable: line.contains("Parallel"),
+                max_attempts: None,
+                dependencies: None,
+            })
+        })
+        .collect()
+}
+
+fn checkbox_task_number(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !(trimmed.starts_with("- [ ]")
+        || trimmed.starts_with("- [x]")
+        || trimmed.starts_with("- [X]"))
+    {
+        return None;
+    }
+    let after_checkbox = trimmed.split_once(']')?.1.trim();
+    let number: String = after_checkbox
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if number.is_empty() {
+        None
+    } else {
+        Some(number)
+    }
 }
 
 fn map_autopilot_run_row(row: &rusqlite::Row) -> rusqlite::Result<AutopilotRunRecord> {

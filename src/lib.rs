@@ -1,6 +1,8 @@
 pub mod autopilot;
+pub mod host_bridge;
 pub mod init;
 pub mod roles;
+pub mod service;
 pub mod session;
 pub mod setup;
 pub mod store;

@@ -10,19 +10,22 @@ use squad::autopilot::{
     all_provider_adapter_overviews, available_providers, background_evidence_search_task_template,
     check_provider_availability, classify_task_difficulty_local, claude_task_eligibility,
     codex_backfill_plan, continuous_integrity_check, cost_latency_path, cost_latency_report_lines,
-    curate_memory, dataset_discovery_task_template, detect_duplicate_work, enforce_caps,
-    estimate_cost_and_rate_limit, estimate_task_difficulty, extract_acceptance_criteria,
-    independent_verification_task_template, next_retry_delay_seconds, plan_failed_task_requeue,
-    provider_adapter_overview, provider_adapters_report_path, provider_tier, read_cost_latency,
-    read_verification_results, recommend_provider_tier, record_cost_latency,
-    record_verification_result, retry_backoff_delays_seconds, tool_availability_scan_task_template,
+    curate_memory, data_librarian_archetype_task_template, dataset_discovery_task_template,
+    detect_duplicate_work, enforce_caps, estimate_cost_and_rate_limit, estimate_task_difficulty,
+    extract_acceptance_criteria, independent_verification_task_template,
+    life_daemon_worker_task_template, next_retry_delay_seconds, plan_failed_task_requeue,
+    plan_life_daemon_cycle, provider_adapter_overview, provider_adapters_report_path,
+    provider_tier, read_cost_latency, read_verification_results, recommend_provider_tier,
+    record_cost_latency, record_verification_result, retry_backoff_delays_seconds,
+    teaching_before_death_task_template, tool_availability_scan_task_template,
     trace_summary_report_lines, verification_result_report_lines, verification_results_path,
     verify_controls, verify_statistics_plan, watchdog_plan, write_provider_adapters_report,
     AdaptiveSchedulingConfig, AutopilotConfig, CostLatencyRecord, CostRateLimitEstimate, CostTier,
     CuratedMemoryItem, DifficultyBand, DifficultyEstimate, DuplicateWorkHit, IntegrityFinding,
-    IntegritySeverity, LocalDifficultyClassification, ModelProvider, ProviderTier, RequeueOutcome,
-    RoundTimeCaps, TaskGraph, TaskGraphStatus, TaskGraphTask, VerificationResultRecord,
-    VerificationVerdict, WatchdogAction, WatchdogActionKind, WorkerHeartbeat,
+    IntegritySeverity, LifeDaemonPolicy, LifeDaemonSoulSnapshot, LocalDifficultyClassification,
+    ModelProvider, ProviderTier, RequeueOutcome, RoundTimeCaps, TaskGraph, TaskGraphStatus,
+    TaskGraphTask, VerificationResultRecord, VerificationVerdict, WatchdogAction,
+    WatchdogActionKind, WorkerHeartbeat,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -50,6 +53,22 @@ fn graph_with(tasks: Vec<TaskGraphTask>) -> TaskGraph {
         prd_path: "PRD.md".to_string(),
         tasks,
         ..TaskGraph::default()
+    }
+}
+
+fn life_snapshot(balance: u64, debt: u64, epoch: u64, death_epoch: u64) -> LifeDaemonSoulSnapshot {
+    LifeDaemonSoulSnapshot {
+        soul_id: "npc-data-1".to_string(),
+        class: "npc".to_string(),
+        status: "alive".to_string(),
+        balance_micro_credits: balance,
+        debt_micro_credits: debt,
+        epoch,
+        natural_death_epoch: death_epoch,
+        child_count: 0,
+        active_storefront_count: 0,
+        open_layerscope_job_count: 0,
+        latest_sii_milli: 700,
     }
 }
 
@@ -848,4 +867,117 @@ fn test_independent_verification_template_requires_separate_verdict() {
         .acceptance_criteria
         .iter()
         .any(|criterion| criterion.contains("does not review its own")));
+}
+
+// Life daemon templates and planner (RealLifeAI tasks 31-33)
+
+#[test]
+fn test_life_daemon_templates_are_pull_queue_ready() {
+    let worker = life_daemon_worker_task_template("31");
+    assert_eq!(worker.status, TaskGraphStatus::ReadyParallel);
+    assert_eq!(worker.assigned_role.as_deref(), Some("life_daemon_worker"));
+    assert!(worker
+        .acceptance_criteria
+        .iter()
+        .any(|criterion| criterion.contains("Fractalwork GET reads")));
+    assert!(worker
+        .acceptance_criteria
+        .iter()
+        .any(|criterion| criterion.contains("per-agent per-epoch spend caps")));
+
+    let librarian = data_librarian_archetype_task_template("32");
+    assert_eq!(librarian.depends_on, vec!["31".to_string()]);
+    assert!(librarian.description.contains("scout DataEvol artifacts"));
+
+    let teaching = teaching_before_death_task_template("33");
+    assert_eq!(teaching.depends_on, vec!["31".to_string()]);
+    assert!(teaching
+        .acceptance_criteria
+        .iter()
+        .any(|criterion| criterion.contains("LayerScope build-specialist")));
+}
+
+#[test]
+fn test_life_daemon_survival_mode_reads_state_and_blocks_nonessential_spend() {
+    let policy = LifeDaemonPolicy::default();
+    let snapshot = life_snapshot(90_000, 10_000, 5, 100);
+
+    let plan = plan_life_daemon_cycle(&snapshot, &policy);
+
+    assert_eq!(plan.mode, "survival");
+    assert_eq!(plan.spend_cap_micro_credits, 90_000);
+    assert!(plan
+        .read_steps
+        .iter()
+        .any(|step| step.path == "/v1/life/agents/npc-data-1"));
+    assert!(plan
+        .read_steps
+        .iter()
+        .any(|step| step.path == "/v1/layerscope/jobs"));
+    assert_eq!(plan.actions.len(), 1);
+    assert_eq!(plan.actions[0].path, "/v1/life/task-slices/run");
+    assert!(plan.actions[0]
+        .body_json
+        .as_ref()
+        .unwrap()
+        .contains("survival"));
+    assert!(plan
+        .blocked_reasons
+        .iter()
+        .any(|reason| reason.contains("debt present")));
+    assert!(plan.planned_spend_micro_credits <= plan.spend_cap_micro_credits);
+}
+
+#[test]
+fn test_data_librarian_policy_imports_dataevol_and_publishes_storefront_under_cap() {
+    let policy = LifeDaemonPolicy {
+        per_epoch_spend_cap_micro_credits: 200_000,
+        ..LifeDaemonPolicy::default()
+    };
+    let snapshot = life_snapshot(900_000, 0, 12, 100);
+
+    let plan = plan_life_daemon_cycle(&snapshot, &policy);
+    let paths: Vec<&str> = plan.actions.iter().map(|step| step.path.as_str()).collect();
+
+    assert_eq!(plan.mode, "growth");
+    assert!(paths.contains(&"/v1/life/storage-attributions/import-dataevol"));
+    assert!(paths.contains(&"/v1/life/storefronts"));
+    assert!(paths.contains(&"/v1/life/task-slices/run"));
+    assert!(paths.iter().any(|path| path.contains("/spawn")));
+    assert!(plan.actions.iter().all(|step| step
+        .idempotency_key
+        .starts_with("life-daemon:npc-data-1:12:")));
+    assert!(plan.planned_spend_micro_credits <= 200_000);
+}
+
+#[test]
+fn test_teaching_before_death_trains_layerscope_specialist_and_registers_unborn_heir() {
+    let policy = LifeDaemonPolicy {
+        per_epoch_spend_cap_micro_credits: 350_000,
+        min_teaching_surplus_micro_credits: 200_000,
+        teaching_window_epochs: 8,
+        ..LifeDaemonPolicy::default()
+    };
+    let mut snapshot = life_snapshot(1_000_000, 0, 94, 100);
+    snapshot.active_storefront_count = 1;
+    snapshot.child_count = policy.max_children;
+
+    let plan = plan_life_daemon_cycle(&snapshot, &policy);
+    let job = plan
+        .actions
+        .iter()
+        .find(|step| step.path == "/v1/layerscope/jobs")
+        .expect("late-life surplus should queue specialist training");
+    let will = plan
+        .actions
+        .iter()
+        .find(|step| step.path == "/v1/life/wills")
+        .expect("late-life teaching should register an unborn-heir will");
+
+    assert_eq!(plan.mode, "teach-before-death");
+    assert!(job.body_json.as_ref().unwrap().contains("build-specialist"));
+    assert!(job.body_json.as_ref().unwrap().contains("host-mlx"));
+    assert!(will.body_json.as_ref().unwrap().contains("unbornHeirs"));
+    assert!(will.body_json.as_ref().unwrap().contains("teachingJob"));
+    assert!(plan.planned_spend_micro_credits <= plan.spend_cap_micro_credits);
 }

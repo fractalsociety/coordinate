@@ -136,6 +136,10 @@ Multiple agents with the same role get unique IDs automatically (`worker`, `work
 | `squad task complete <agent> <task-id> --summary <text>` | Mark an acked task complete with a summary |
 | `squad task requeue <task-id> [--to <agent>]` | Put a task back into the queue, optionally to a new assignee |
 | `squad task list [--agent <id>] [--status <status>]` | List tasks with optional filters |
+| Coordinate HTTP `POST /tasks/next` | Pull-claim the best ready service task for a worker |
+| Coordinate HTTP `POST /tasks/:id/touch` | Renew a claimed service-task lease |
+| Coordinate HTTP `POST /tasks/reap` | Requeue expired leases and release stale direct assignments |
+| Coordinate HTTP `GET /tasks/stats` | Inspect service queue lanes, in-flight work, and provider throughput |
 | `squad pending` | Show all unread messages |
 | `squad history [agent] [--from <id>] [--to <id>] [--since <RFC3339\|unix-seconds>]` | Show timestamped message history with optional filters |
 | `squad roles` | List available roles |

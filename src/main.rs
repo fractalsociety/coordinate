@@ -88,6 +88,9 @@ fn main() -> Result<()> {
             cmd_receive(&id, wait, timeout_secs, json)
         }
         "task" => cmd_task(args.collect()),
+        "serve" => cmd_serve(args.collect()),
+        "host-bridge" => cmd_host_bridge(args.collect()),
+        "host-bridge-sim-worker" => squad::host_bridge::run_simulated_worker(),
         "autopilot" | "swarm" => cmd_autopilot(args.collect()),
         "pending" => cmd_pending(),
         "history" => {
@@ -1976,6 +1979,187 @@ fn cmd_task_list(options: TaskListOptions) -> Result<()> {
     Ok(())
 }
 
+fn cmd_serve(args: Vec<String>) -> Result<()> {
+    let mut bind = "127.0.0.1:8787".to_string();
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                bind = args
+                    .get(i + 1)
+                    .context("--bind requires an address, for example 127.0.0.1:8787")?
+                    .clone();
+                i += 2;
+            }
+            flag => bail!("unknown serve flag: {flag}"),
+        }
+    }
+    let workspace = find_workspace()?;
+    let db_path = workspace.join(".squad").join("messages.db");
+    let bind = bind
+        .parse()
+        .with_context(|| format!("invalid --bind address: {bind}"))?;
+    println!("Starting Coordinate HTTP service on http://{bind}");
+    tokio::runtime::Runtime::new()?.block_on(squad::service::serve(squad::service::ServeOptions {
+        db_path,
+        bind,
+    }))
+}
+
+fn cmd_host_bridge(args: Vec<String>) -> Result<()> {
+    let mut service_url = "http://127.0.0.1:8787".to_string();
+    let mut auth_token = None;
+    let mut config_path = None;
+    let mut worker_id = String::new();
+    let mut kind = "codex".to_string();
+    let mut role = "coding_worker".to_string();
+    let mut tmux_target = String::new();
+    let mut command = None;
+    let mut create_session = true;
+    let mut readiness_timeout_secs = None;
+    let mut readiness_poll_secs = 2u64;
+    let mut interval_secs = 5u64;
+    let mut once = false;
+    let mut auto_assign = true;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--service-url" => {
+                service_url = args
+                    .get(i + 1)
+                    .context("--service-url requires a URL")?
+                    .clone();
+                i += 2;
+            }
+            "--auth-token" => {
+                auth_token = Some(
+                    args.get(i + 1)
+                        .context("--auth-token requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--config" => {
+                config_path = Some(PathBuf::from(
+                    args.get(i + 1).context("--config requires a path")?,
+                ));
+                i += 2;
+            }
+            "--worker-id" => {
+                worker_id = args
+                    .get(i + 1)
+                    .context("--worker-id requires a value")?
+                    .clone();
+                i += 2;
+            }
+            "--kind" => {
+                kind = args.get(i + 1).context("--kind requires a value")?.clone();
+                i += 2;
+            }
+            "--role" => {
+                role = args.get(i + 1).context("--role requires a value")?.clone();
+                i += 2;
+            }
+            "--tmux-target" => {
+                tmux_target = args
+                    .get(i + 1)
+                    .context("--tmux-target requires a tmux target, for example squad:0.1")?
+                    .clone();
+                i += 2;
+            }
+            "--command" => {
+                command = Some(
+                    args.get(i + 1)
+                        .context("--command requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--no-create-session" => {
+                create_session = false;
+                i += 1;
+            }
+            "--readiness-timeout-secs" => {
+                let value = args
+                    .get(i + 1)
+                    .context("--readiness-timeout-secs requires a positive integer")?;
+                readiness_timeout_secs =
+                    Some(value.parse().with_context(|| {
+                        format!("invalid --readiness-timeout-secs value: {value}")
+                    })?);
+                i += 2;
+            }
+            "--readiness-poll-secs" => {
+                let value = args
+                    .get(i + 1)
+                    .context("--readiness-poll-secs requires a positive integer")?;
+                readiness_poll_secs = value
+                    .parse()
+                    .with_context(|| format!("invalid --readiness-poll-secs value: {value}"))?;
+                i += 2;
+            }
+            "--interval-secs" => {
+                let value = args
+                    .get(i + 1)
+                    .context("--interval-secs requires a positive integer")?;
+                interval_secs = value
+                    .parse()
+                    .with_context(|| format!("invalid --interval-secs value: {value}"))?;
+                i += 2;
+            }
+            "--once" => {
+                once = true;
+                i += 1;
+            }
+            "--no-auto-assign" => {
+                auto_assign = false;
+                i += 1;
+            }
+            "--help" | "-h" => {
+                println!("{HOST_BRIDGE_USAGE}");
+                return Ok(());
+            }
+            flag => bail!("unknown host-bridge flag: {flag}"),
+        }
+    }
+    if let Some(config_path) = config_path {
+        return squad::host_bridge::run_host_bridge_config(&config_path, once);
+    }
+    if worker_id.trim().is_empty() {
+        bail!("{HOST_BRIDGE_USAGE}");
+    }
+    if tmux_target.trim().is_empty() {
+        bail!("{HOST_BRIDGE_USAGE}");
+    }
+    squad::host_bridge::run_host_bridge(squad::host_bridge::HostBridgeOptions {
+        service_url,
+        auth_token,
+        worker_id,
+        kind: kind.clone(),
+        role,
+        tmux_target,
+        command: command.unwrap_or_else(|| match kind.as_str() {
+            "claude" => "claude --dangerously-skip-permissions".to_string(),
+            "codex" => "codex --yolo".to_string(),
+            other => other.to_string(),
+        }),
+        create_session,
+        readiness_timeout_secs: readiness_timeout_secs.unwrap_or_else(|| {
+            if kind == "codex" {
+                90
+            } else if kind == "claude" {
+                45
+            } else {
+                30
+            }
+        }),
+        readiness_poll_secs,
+        interval_secs,
+        once,
+        auto_assign,
+    })
+}
+
 fn cmd_pending() -> Result<()> {
     let workspace = find_workspace()?;
     let store = open_store(&workspace)?;
@@ -2220,6 +2404,12 @@ COMMANDS
                                              Requeue a task, optionally to a new assignee
   squad task list [--agent <id>] [--status <status>]
                                              List tasks with optional filters
+  squad serve [--bind <addr:port>]           Run Coordinate HTTP service mode (default 127.0.0.1:8787)
+                                             HTTP pull queue: POST /tasks/next, POST /tasks/:id/touch, GET /tasks/stats
+  squad host-bridge --worker-id <id> --tmux-target <target>
+                                             Bridge a host tmux pane to Coordinate HTTP pull-queue tasks and reports
+  squad host-bridge --config <host-bridge.toml>  Run configured host-side Codex/Claude worker bridge
+  squad host-bridge-sim-worker                  Deterministic stdin/stdout worker for bridge smokes
   squad autopilot init                       Initialize Autopilot config and generated-role/team directories
   squad autopilot plan <PRD.md>              Read a PRD and print an Autopilot task status summary
   squad autopilot run <PRD.md>               Create an Autopilot run, team, graph, sessions, and initial assignments
@@ -2265,4 +2455,34 @@ EXAMPLES
   squad send manager @all "API contract updated, rebase your work"
   squad receive worker --json
   squad history worker --from manager --since 2024-01-02T00:00:00Z
+"#;
+
+const HOST_BRIDGE_USAGE: &str = r#"Usage:
+  squad host-bridge --worker-id <id> --tmux-target <target> [options]
+  squad host-bridge --config <host-bridge.toml> [--once]
+
+Options:
+  --service-url <url>       Coordinate HTTP service URL (default http://127.0.0.1:8787)
+  --auth-token <token>      Optional bearer token for Coordinate HTTP
+  --config <path>           TOML config with [[workers]] definitions
+  --kind <codex|claude|...> Worker kind registered with Coordinate (default codex)
+  --role <role>             Worker role registered with Coordinate (default coding_worker)
+  --command <cmd>           Worker command for spawned tmux sessions
+  --no-create-session       Require an existing tmux target instead of spawning one
+  --readiness-timeout-secs <n>
+                            Wait this long for tmux readiness (default codex 90, claude 45)
+  --readiness-poll-secs <n> Readiness poll interval (default 2)
+  --interval-secs <n>       Poll/heartbeat interval (default 5)
+  --once                    Run one bridge tick and exit
+  --no-auto-assign          Heartbeat and report only; do not pull queued tasks
+
+The bridge runs on the macOS host, not inside the Linux Coordinate container.
+It validates the tmux pane, registers/heartbeats the worker, injects assigned
+task briefs, and captures pane output. A worker completes by printing one line:
+
+  COORDINATE_REPORT_JSON: {"summary":"...","filesInspected":[],"changedFiles":[],"testsRun":[],"verification":"...","risks":"...","rawReport":"..."}
+
+Blocked/failed markers:
+  COORDINATE_BLOCKED: <reason>
+  COORDINATE_FAILED: <reason>
 "#;
