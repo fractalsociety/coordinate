@@ -1,4 +1,5 @@
 pub mod autopilot;
+pub mod fractal_runtime;
 pub mod host_bridge;
 pub mod init;
 pub mod roles;

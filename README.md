@@ -79,6 +79,15 @@ squad init
 
 That's it. Each agent joins, reads its role instructions, and enters a work loop that checks for messages. The manager breaks down your goal and assigns tasks to workers.
 
+## Fractal Runtime Jobs
+
+The `fractal_runtime` library module provides Coordinate's durable adapter for
+long-running Fractal execution graphs. It retains work and graph hashes,
+provider/local execution identity, lease expiry, resource mode, cancellation,
+resume checkpoint, and verified evidence root in SQLite. The adapter emits the
+typed `fractald` admit, cancel, state-poll, and evidence-poll envelopes; it never
+scrapes raw model or container logs.
+
 ## Optional tmux Launcher
 
 For Unix-like environments that already use Claude Code, this repo also ships an optional helper script:
