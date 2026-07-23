@@ -98,6 +98,13 @@ pub struct TouchTaskRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReleaseTaskClaimRequest {
+    worker_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueStatsQuery {
     window_secs: Option<i64>,
 }
@@ -169,12 +176,17 @@ pub fn router(db_path: PathBuf) -> Router {
         .route("/tasks/:task_id/ack", post(ack_task))
         .route("/tasks/:task_id/start", post(start_task))
         .route("/tasks/:task_id/touch", post(touch_task))
+        .route("/tasks/:task_id/release-claim", post(release_task_claim))
         .route("/tasks/:task_id/progress", post(progress_task))
         .route(
             "/tasks/:task_id/report",
             get(get_task_report).post(report_task),
         )
-        .route("/tasks/:task_id/verify", post(verify_task))
+        .route(
+            "/tasks/:task_id/verify",
+            get(get_task_verification).post(verify_task),
+        )
+        .route("/tasks/:task_id/reject", post(reject_task))
         .route("/tasks/:task_id/retry", post(retry_task))
         .route("/tasks/:task_id/complete", post(complete_task))
         .route("/tasks/:task_id/fail", post(fail_task))
@@ -316,6 +328,22 @@ async fn touch_task(
     ))
 }
 
+async fn release_task_claim(
+    State(state): State<ServiceState>,
+    Path(task_id): Path<String>,
+    Json(input): Json<ReleaseTaskClaimRequest>,
+) -> Result<Json<impl Serialize>, ServiceError> {
+    let worker_id = input.worker_id.trim();
+    if worker_id.is_empty() {
+        return Err(anyhow::anyhow!("workerId cannot be empty").into());
+    }
+    Ok(Json(open_store(&state)?.service_release_task_claim(
+        worker_id,
+        &task_id,
+        &input.reason,
+    )?))
+}
+
 async fn ack_task(
     State(state): State<ServiceState>,
     Path(task_id): Path<String>,
@@ -370,6 +398,16 @@ async fn verify_task(
     ))
 }
 
+async fn get_task_verification(
+    State(state): State<ServiceState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<impl Serialize>, ServiceError> {
+    let verification = open_store(&state)?
+        .service_get_task_verification(&task_id)?
+        .with_context(|| format!("service task verification does not exist: {task_id}"))?;
+    Ok(Json(verification))
+}
+
 async fn retry_task(
     State(state): State<ServiceState>,
     Path(task_id): Path<String>,
@@ -377,6 +415,16 @@ async fn retry_task(
 ) -> Result<Json<impl Serialize>, ServiceError> {
     Ok(Json(
         open_store(&state)?.service_retry_task(&task_id, &input.reason)?,
+    ))
+}
+
+async fn reject_task(
+    State(state): State<ServiceState>,
+    Path(task_id): Path<String>,
+    Json(input): Json<RetryTaskRequest>,
+) -> Result<Json<impl Serialize>, ServiceError> {
+    Ok(Json(
+        open_store(&state)?.service_reject_task(&task_id, &input.reason)?,
     ))
 }
 

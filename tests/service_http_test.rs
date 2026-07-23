@@ -52,6 +52,38 @@ fn register_service_worker(
         .unwrap()
 }
 
+#[test]
+fn service_store_accepts_cursor_worker_and_task_provider() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(&tmp.path().join("messages.db")).unwrap();
+
+    let worker = register_service_worker(&store, "cursor-1", " Cursor ");
+    assert_eq!(worker.kind, "cursor");
+
+    let task = create_service_task(&store, "Cursor task", "CURSOR", 1);
+    assert_eq!(task.preferred_model, "cursor");
+}
+
+#[test]
+fn service_store_rejects_unknown_worker_kind_with_cursor_in_allowed_list() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(&tmp.path().join("messages.db")).unwrap();
+
+    let error = store
+        .service_register_worker(ServiceWorkerInput {
+            id: "unknown-1".to_string(),
+            kind: "unknown".to_string(),
+            role: "coding_worker".to_string(),
+            status: None,
+            capacity: Some(1),
+            metadata: None,
+        })
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("Expected codex, claude, cursor"));
+}
+
 fn create_service_task(
     store: &Store,
     title: &str,
@@ -127,7 +159,7 @@ fn service_store_runs_worker_task_lifecycle_and_redacts_reports() {
             &task.id,
             ServiceTaskReportInput {
                 summary: "Done with token=secret-value".to_string(),
-                files_inspected: vec!["/Users/jamesstar/private/file.rs".to_string()],
+                files_inspected: vec!["/Users/example/private/file.rs".to_string()],
                 changed_files: vec!["src/service.rs".to_string()],
                 tests_run: vec!["cargo test sk-1234567890abcdef".to_string()],
                 verification: "Focused tests pass".to_string(),
@@ -154,11 +186,27 @@ fn service_store_runs_worker_task_lifecycle_and_redacts_reports() {
             &task.id,
             squad::store::ServiceTaskProgressInput {
                 summary: "verification reviewed".to_string(),
+                decision: Some("complete".to_string()),
+                evidence_hash: Some(format!("sha256:{}", "a".repeat(64))),
+                evidence: Some(serde_json::json!({
+                    "publicCheck": {"passed": true},
+                    "hiddenRegression": {"passed": true},
+                    "verifierVerdicts": [{"verifierId": "fractal-verify-1", "verdict": "pass"}]
+                })),
             },
         )
         .unwrap();
     assert_eq!(verified.state, "verified");
     assert!(verified.verified_at.is_some());
+    let verification = store
+        .service_get_task_verification(&task.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(verification.decision, "complete");
+    assert_eq!(
+        verification.evidence["hiddenRegression"]["passed"],
+        serde_json::Value::Bool(true)
+    );
 
     let completed = store.service_complete_task(&task.id).unwrap();
     assert_eq!(completed.state, "complete");
@@ -604,6 +652,116 @@ fn service_store_retry_policy_enforces_max_attempts() {
     assert!(error.contains("exceeded max attempts"));
 }
 
+#[test]
+fn rejected_graph_node_retries_once_escalates_and_never_double_claims() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("messages.db");
+    let store = Store::open(&db_path).unwrap();
+    register_service_worker(&store, "codex-1", "codex");
+    register_service_worker(&store, "codex-2", "codex");
+    let task = store
+        .service_create_task(ServiceTaskInput {
+            title: "Rejected graph node".to_string(),
+            description: "Exercise verifier rejection lifecycle".to_string(),
+            acceptance_criteria: vec!["retry then escalate".to_string()],
+            source_prd_path: "fractal-graph:graph:test:sha256:abc".to_string(),
+            source_task_number: Some("verify".to_string()),
+            priority: 10,
+            preferred_model: "codex".to_string(),
+            role: "coding_worker".to_string(),
+            parallelizable: true,
+            max_attempts: Some(1),
+            dependencies: None,
+        })
+        .unwrap();
+
+    let first = store
+        .service_claim_next_task("codex-1", 900, DEFAULT_SERVICE_LANE_ESCAPE_SECS)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.id, task.id);
+    store.service_start_task(&task.id).unwrap();
+    report_rejected_graph_node(&store, &task.id);
+    let retried = store
+        .service_reject_task(&task.id, "hidden regression missing")
+        .unwrap();
+    assert_eq!(retried.state, "queued");
+    assert_eq!(retried.attempt, 1);
+    assert_eq!(retried.lease_owner, None);
+    assert_eq!(retried.lease_expires_at, None);
+    drop(store);
+
+    let claims = ["codex-1", "codex-2"]
+        .into_iter()
+        .map(|worker_id| {
+            let db_path = db_path.clone();
+            thread::spawn(move || {
+                Store::open(&db_path)
+                    .unwrap()
+                    .service_claim_next_task(worker_id, 900, DEFAULT_SERVICE_LANE_ESCAPE_SECS)
+                    .unwrap()
+                    .map(|claimed| (worker_id.to_string(), claimed.id))
+            })
+        })
+        .map(|handle| handle.join().unwrap())
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].1, task.id);
+
+    let store = Store::open(&db_path).unwrap();
+    store.service_start_task(&task.id).unwrap();
+    report_rejected_graph_node(&store, &task.id);
+    let escalated = store
+        .service_reject_task(&task.id, "public verifier still failing")
+        .unwrap();
+    assert_eq!(escalated.state, "blocked");
+    assert_eq!(escalated.lease_owner, None);
+    assert!(escalated
+        .failure_reason
+        .as_deref()
+        .unwrap()
+        .contains("verification retries exhausted"));
+    assert!(store
+        .service_claim_next_task(
+            if claims[0].0 == "codex-1" {
+                "codex-2"
+            } else {
+                "codex-1"
+            },
+            900,
+            DEFAULT_SERVICE_LANE_ESCAPE_SECS,
+        )
+        .unwrap()
+        .is_none());
+
+    let event_types = store
+        .service_list_events(Some(&task.id), None, 20)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&"task.retry".to_string()));
+    assert!(event_types.contains(&"task.blocked".to_string()));
+}
+
+fn report_rejected_graph_node(store: &Store, task_id: &str) {
+    store
+        .service_report_task(
+            task_id,
+            ServiceTaskReportInput {
+                summary: "worker report".to_string(),
+                files_inspected: Vec::new(),
+                changed_files: Vec::new(),
+                tests_run: vec!["fixture".to_string()],
+                verification: "worker evidence".to_string(),
+                risks: "none".to_string(),
+                raw_report: "reported".to_string(),
+            },
+        )
+        .unwrap();
+}
+
 #[tokio::test]
 async fn service_http_health_and_task_create_routes_work() {
     let tmp = TempDir::new().unwrap();
@@ -875,6 +1033,37 @@ fn service_pull_queue_claims_direct_assignment_before_higher_priority_queue_work
     let urgent = store.service_get_task(&urgent.id).unwrap().unwrap();
     assert_eq!(urgent.state, "queued");
     assert_eq!(urgent.assigned_worker_id, None);
+}
+
+#[test]
+fn service_pull_queue_releases_unstarted_claim_without_consuming_retry() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(&tmp.path().join("messages.db")).unwrap();
+    register_service_worker(&store, "codex-1", "codex");
+    let task = create_service_task(&store, "Graph node lease", "codex", 1);
+    let claimed = store
+        .service_claim_next_task("codex-1", 900, DEFAULT_SERVICE_LANE_ESCAPE_SECS)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, task.id);
+
+    let released = store
+        .service_release_task_claim("codex-1", &task.id, "execution graph checkout conflict")
+        .unwrap();
+    assert_eq!(released.state, "queued");
+    assert_eq!(released.assigned_worker_id, None);
+    assert_eq!(released.lease_owner, None);
+    assert_eq!(released.retry_count, 0);
+    assert_eq!(released.attempt, 0);
+    assert_eq!(
+        store.service_get_worker("codex-1").unwrap().unwrap().status,
+        "ready"
+    );
+    assert!(store
+        .service_list_events(Some(&task.id), None, 10)
+        .unwrap()
+        .iter()
+        .any(|event| event.event_type == "task.claim_released"));
 }
 
 #[test]

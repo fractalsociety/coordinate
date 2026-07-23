@@ -89,6 +89,8 @@ fn main() -> Result<()> {
         }
         "task" => cmd_task(args.collect()),
         "serve" => cmd_serve(args.collect()),
+        "fractal-runtime" => cmd_fractal_runtime(args.collect()),
+        "graph-supervisor" => cmd_graph_supervisor(args.collect()),
         "host-bridge" => cmd_host_bridge(args.collect()),
         "host-bridge-sim-worker" => squad::host_bridge::run_simulated_worker(),
         "autopilot" | "swarm" => cmd_autopilot(args.collect()),
@@ -416,6 +418,132 @@ fn agent_envelope(agent: &squad::store::AgentRecord) -> AgentEnvelope {
         effective_protocol_version: effective_protocol_version(agent),
         supports_task_commands: supports_capability(agent),
         supports_json_receive: supports_capability(agent),
+    }
+}
+
+fn cmd_fractal_runtime(args: Vec<String>) -> Result<()> {
+    if args.first().map(String::as_str) != Some("run") {
+        bail!("Usage: squad fractal-runtime run --input <submission.json> --db <coordinate.sqlite3> (--fractald-socket <path> | --fractald-url <origin>) [--poll-ms <n>] [--max-polls <n>]");
+    }
+    let mut input_path = None;
+    let mut database_path = None;
+    let mut fractald_url = None;
+    let mut fractald_socket = None;
+    let mut poll_ms = 1_000_u64;
+    let mut max_polls = 3_600_usize;
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .with_context(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--input" => input_path = Some(PathBuf::from(value)),
+            "--db" => database_path = Some(PathBuf::from(value)),
+            "--fractald-url" => fractald_url = Some(value.clone()),
+            "--fractald-socket" => fractald_socket = Some(PathBuf::from(value)),
+            "--poll-ms" => {
+                poll_ms = value
+                    .parse()
+                    .with_context(|| format!("invalid --poll-ms value: {value}"))?
+            }
+            "--max-polls" => {
+                max_polls = value
+                    .parse()
+                    .with_context(|| format!("invalid --max-polls value: {value}"))?
+            }
+            _ => bail!("unknown fractal-runtime flag: {flag}"),
+        }
+        index += 2;
+    }
+
+    let input_path = input_path.context("--input is required")?;
+    let database_path = database_path.context("--db is required")?;
+    if fractald_url.is_some() == fractald_socket.is_some() {
+        bail!("provide exactly one of --fractald-socket or --fractald-url");
+    }
+    let submission: squad::fractal_runtime::RuntimeJobSubmission = serde_json::from_slice(
+        &std::fs::read(&input_path)
+            .with_context(|| format!("failed to read {}", input_path.display()))?,
+    )
+    .with_context(|| format!("invalid runtime submission {}", input_path.display()))?;
+    let store = squad::fractal_runtime::RuntimeJobStore::open(&database_path)?;
+    let poll_interval = Duration::from_millis(poll_ms);
+    let job = if let Some(socket_path) = fractald_socket {
+        let client = squad::fractal_runtime::UdsFractaldClient::new(socket_path)?;
+        squad::fractal_runtime::run_runtime_job(
+            &client,
+            &store,
+            submission,
+            poll_interval,
+            max_polls,
+        )?
+    } else {
+        let client = squad::fractal_runtime::HttpFractaldClient::new(
+            fractald_url.as_deref().expect("checked HTTP origin"),
+        )?;
+        squad::fractal_runtime::run_runtime_job(
+            &client,
+            &store,
+            submission,
+            poll_interval,
+            max_polls,
+        )?
+    };
+    println!("{}", serde_json::to_string_pretty(&job)?);
+    Ok(())
+}
+
+fn cmd_graph_supervisor(args: Vec<String>) -> Result<()> {
+    let mut graph_path = None;
+    let mut database_path = None;
+    let mut watch = false;
+    let mut interval_ms = 1_000_u64;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--graph" | "--db" | "--interval-ms" => {
+                let flag = args[index].as_str();
+                let value = args
+                    .get(index + 1)
+                    .with_context(|| format!("{flag} requires a value"))?;
+                match flag {
+                    "--graph" => graph_path = Some(PathBuf::from(value)),
+                    "--db" => database_path = Some(PathBuf::from(value)),
+                    "--interval-ms" => {
+                        interval_ms = value
+                            .parse()
+                            .with_context(|| format!("invalid --interval-ms value: {value}"))?
+                    }
+                    _ => unreachable!(),
+                }
+                index += 2;
+            }
+            "--watch" => {
+                watch = true;
+                index += 1;
+            }
+            flag => bail!("unknown graph-supervisor flag: {flag}"),
+        }
+    }
+    let graph_path = graph_path.context("--graph is required")?;
+    let database_path = database_path.context("--db is required")?;
+    let graph: squad::graph_supervisor::CompiledExecutionGraph = serde_json::from_slice(
+        &std::fs::read(&graph_path)
+            .with_context(|| format!("failed to read {}", graph_path.display()))?,
+    )
+    .with_context(|| format!("invalid execution graph {}", graph_path.display()))?;
+    graph.validate()?;
+    let node_count = graph.nodes.len();
+    let store = squad::store::Store::open(&database_path)?;
+    loop {
+        let result = squad::graph_supervisor::reconcile_ready_graph_nodes(&store, &graph)?;
+        println!("{}", serde_json::to_string(&result)?);
+        let finished = result.complete_node_ids.len() == node_count;
+        if !watch || finished {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(interval_ms));
     }
 }
 
@@ -2008,6 +2136,7 @@ fn cmd_serve(args: Vec<String>) -> Result<()> {
 
 fn cmd_host_bridge(args: Vec<String>) -> Result<()> {
     let mut service_url = "http://127.0.0.1:8787".to_string();
+    let mut execution_graph_url = Some("http://127.0.0.1:8091".to_string());
     let mut auth_token = None;
     let mut config_path = None;
     let mut worker_id = String::new();
@@ -2029,6 +2158,14 @@ fn cmd_host_bridge(args: Vec<String>) -> Result<()> {
                     .get(i + 1)
                     .context("--service-url requires a URL")?
                     .clone();
+                i += 2;
+            }
+            "--execution-graph-url" => {
+                execution_graph_url = Some(
+                    args.get(i + 1)
+                        .context("--execution-graph-url requires a URL")?
+                        .clone(),
+                );
                 i += 2;
             }
             "--auth-token" => {
@@ -2133,6 +2270,8 @@ fn cmd_host_bridge(args: Vec<String>) -> Result<()> {
     }
     squad::host_bridge::run_host_bridge(squad::host_bridge::HostBridgeOptions {
         service_url,
+        execution_graph_url,
+        node_verifier: None,
         auth_token,
         worker_id,
         kind: kind.clone(),
@@ -2406,6 +2545,10 @@ COMMANDS
                                              List tasks with optional filters
   squad serve [--bind <addr:port>]           Run Coordinate HTTP service mode (default 127.0.0.1:8787)
                                              HTTP pull queue: POST /tasks/next, POST /tasks/:id/touch, GET /tasks/stats
+  squad fractal-runtime run --input <submission.json> --db <coordinate.sqlite3> (--fractald-socket <path> | --fractald-url <origin>)
+                                             Admit a signed graph to fractald and durably poll state + evidence
+  squad graph-supervisor --graph <graph.json> --db <coordinate.sqlite3> [--watch] [--interval-ms <n>]
+                                             Enqueue dependency-ready compiled graph nodes into the pull queue
   squad host-bridge --worker-id <id> --tmux-target <target>
                                              Bridge a host tmux pane to Coordinate HTTP pull-queue tasks and reports
   squad host-bridge --config <host-bridge.toml>  Run configured host-side Codex/Claude worker bridge
@@ -2458,7 +2601,7 @@ EXAMPLES
 "#;
 
 const HOST_BRIDGE_USAGE: &str = r#"Usage:
-  squad host-bridge --worker-id <id> --tmux-target <target> [options]
+  squad host-bridge --worker-id <id> --tmux-target <target> [--execution-graph-url <url>] [options]
   squad host-bridge --config <host-bridge.toml> [--once]
 
 Options:

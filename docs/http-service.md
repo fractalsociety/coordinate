@@ -68,7 +68,9 @@ What the bridge does:
 - Registers the worker with `/workers/register`.
 - Sends `/workers/{id}/heartbeat` on every interval.
 - Pulls one queued task when the worker is idle, assigns it, acknowledges it, and injects a task brief into the tmux pane.
-- Captures pane output and posts `/tasks/{id}/report` plus `/tasks/{id}/complete` when the worker prints a structured completion marker.
+- Captures pane output and posts `/tasks/{id}/report` when the worker prints a structured completion marker.
+- For ordinary PRD tasks, verifies and completes the report through the service lifecycle.
+- For compiled graph nodes, runs the configured independent DataEvol/verifier gate, stores its evidence at `/tasks/{id}/verify`, and completes, retries, or escalates the node and its board checkout.
 - Posts `/tasks/{id}/fail` when the pane prints a blocked or failed marker.
 
 Completion marker contract:

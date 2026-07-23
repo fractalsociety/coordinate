@@ -15,6 +15,7 @@ use crate::teams::{TeamConfig, TeamRole};
 pub enum ModelProvider {
     Claude,
     Codex,
+    Cursor,
     Gemini,
     OpenCode,
     #[serde(
@@ -37,6 +38,7 @@ impl ModelProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::OpenCode => "opencode",
             Self::OpenRouterFree => "openrouter_free",
@@ -59,13 +61,14 @@ impl FromStr for ModelProvider {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "cursor" => Ok(Self::Cursor),
             "gemini" => Ok(Self::Gemini),
             "opencode" => Ok(Self::OpenCode),
             "openrouter_free" | "openrouter-free" => Ok(Self::OpenRouterFree),
             "openrouter_cheap" | "openrouter-cheap" => Ok(Self::OpenRouterCheap),
             "local" => Ok(Self::Local),
             _ => bail!(
-                "invalid model provider '{value}'. Expected one of: claude, codex, gemini, opencode, openrouter_free, openrouter_cheap, local"
+                "invalid model provider '{value}'. Expected one of: claude, codex, cursor, gemini, opencode, openrouter_free, openrouter_cheap, local"
             ),
         }
     }
@@ -3043,6 +3046,7 @@ pub fn provider_tool_command(provider: &ModelProvider) -> ProviderToolCommand {
     let (program, args) = match provider {
         ModelProvider::Claude => ("claude", vec!["--dangerously-skip-permissions".to_string()]),
         ModelProvider::Codex => ("codex", vec!["--yolo".to_string()]),
+        ModelProvider::Cursor => ("cursor-agent", Vec::new()),
         ModelProvider::Gemini => ("gemini", Vec::new()),
         ModelProvider::OpenCode => ("opencode", Vec::new()),
         ModelProvider::OpenRouterFree => (
@@ -3225,7 +3229,9 @@ pub fn provider_tier(provider: &ModelProvider) -> ProviderTier {
     match provider {
         ModelProvider::Local => ProviderTier::Local,
         ModelProvider::OpenRouterFree => ProviderTier::Free,
-        ModelProvider::Codex | ModelProvider::OpenRouterCheap => ProviderTier::Cheap,
+        ModelProvider::Codex | ModelProvider::Cursor | ModelProvider::OpenRouterCheap => {
+            ProviderTier::Cheap
+        }
         ModelProvider::Claude | ModelProvider::Gemini | ModelProvider::OpenCode => {
             ProviderTier::Frontier
         }
@@ -3249,6 +3255,7 @@ pub fn all_provider_adapter_overviews() -> Vec<ProviderAdapterOverview> {
     [
         ModelProvider::Claude,
         ModelProvider::Codex,
+        ModelProvider::Cursor,
         ModelProvider::Gemini,
         ModelProvider::OpenCode,
         ModelProvider::OpenRouterFree,
@@ -3708,6 +3715,14 @@ pub fn estimate_cost_and_rate_limit(provider: &ModelProvider) -> CostRateLimitEs
             relative_cost: 5,
             rate_limit_per_minute: None,
             notes: "Codex coding workers; usage counted against the Codex plan.".to_string(),
+        },
+        ModelProvider::Cursor => CostRateLimitEstimate {
+            provider: provider.as_str().to_string(),
+            cost_tier: CostTier::Cheap,
+            relative_cost: 5,
+            rate_limit_per_minute: None,
+            notes: "Cursor coding workers; usage counted against the configured Cursor plan."
+                .to_string(),
         },
         ModelProvider::Gemini | ModelProvider::OpenCode => CostRateLimitEstimate {
             provider: provider.as_str().to_string(),

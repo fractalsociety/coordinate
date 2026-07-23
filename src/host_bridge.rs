@@ -3,11 +3,17 @@ use reqwest::blocking::Client;
 use reqwest::blocking::ClientBuilder;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+
+use crate::node_verifier::{
+    run_node_verifier, NodeVerificationRequest, NodeVerifierConfig, VerificationDecision,
+    VerificationOutcome,
+};
 
 const REPORT_MARKER: &str = "COORDINATE_REPORT_JSON:";
 const ACK_MARKER: &str = "COORDINATE_ACK:";
@@ -17,6 +23,8 @@ const BLOCKED_MARKER: &str = "COORDINATE_BLOCKED:";
 #[derive(Debug, Clone)]
 pub struct HostBridgeOptions {
     pub service_url: String,
+    pub execution_graph_url: Option<String>,
+    pub node_verifier: Option<NodeVerifierConfig>,
     pub auth_token: Option<String>,
     pub worker_id: String,
     pub kind: String,
@@ -35,12 +43,14 @@ pub struct HostBridgeOptions {
 #[serde(rename_all = "camelCase")]
 pub struct HostBridgeConfig {
     pub service_url: Option<String>,
+    pub execution_graph_url: Option<String>,
     pub auth_token: Option<String>,
     pub tmux_session_prefix: Option<String>,
     pub startup_timeout_secs: Option<u64>,
     pub readiness_poll_secs: Option<u64>,
     pub interval_secs: Option<u64>,
     pub log_dir: Option<String>,
+    pub node_verifier: Option<NodeVerifierConfig>,
     #[serde(default)]
     pub workers: Vec<HostBridgeWorkerConfig>,
 }
@@ -101,6 +111,25 @@ struct FailTaskRequest {
     blocked: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseTaskClaimRequest {
+    worker_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphCheckoutRequest {
+    agent_id: String,
+    agent_label: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryTaskRequest {
+    reason: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct WorkerRecord {
@@ -130,13 +159,16 @@ pub struct BridgeTaskRecord {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeTaskReport {
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub summary: String,
     pub files_inspected: Vec<String>,
     pub changed_files: Vec<String>,
     pub tests_run: Vec<String>,
     pub verification: String,
-    #[serde(deserialize_with = "deserialize_risks_string")]
+    #[serde(deserialize_with = "deserialize_flexible_string")]
     pub risks: String,
+    #[serde(deserialize_with = "deserialize_flexible_string")]
     pub raw_report: String,
 }
 
@@ -148,7 +180,7 @@ pub enum PaneMarker {
     Blocked(String),
 }
 
-fn deserialize_risks_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_flexible_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -172,6 +204,7 @@ where
 struct BridgeRuntimeState {
     delivered_tasks: BTreeSet<String>,
     completed_markers: BTreeSet<String>,
+    board_checked_out_tasks: BTreeSet<String>,
 }
 
 const HOST_BRIDGE_LEASE_SECS: i64 = 15 * 60;
@@ -277,6 +310,7 @@ pub fn run_simulated_worker() -> Result<()> {
                 println!(
                     "{REPORT_MARKER} {}",
                     serde_json::to_string(&BridgeTaskReport {
+                        task_id: Some(task_id.clone()),
                         summary: format!("Simulated worker completed {title}"),
                         files_inspected: vec!["simulated-worker".to_string()],
                         changed_files: Vec::new(),
@@ -302,6 +336,10 @@ impl HostBridgeConfig {
             .service_url
             .clone()
             .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+        let execution_graph_url = self
+            .execution_graph_url
+            .clone()
+            .or_else(|| Some("http://127.0.0.1:8091".to_string()));
         self.workers
             .iter()
             .map(|worker| {
@@ -313,6 +351,8 @@ impl HostBridgeConfig {
                     .unwrap_or_else(|| format!("{prefix}-{id}"));
                 Ok(HostBridgeOptions {
                     service_url: service_url.clone(),
+                    execution_graph_url: execution_graph_url.clone(),
+                    node_verifier: self.node_verifier.clone(),
                     auth_token: self.auth_token.clone(),
                     worker_id: id,
                     kind: kind.clone(),
@@ -367,7 +407,42 @@ fn bridge_tick(
     let Some(task_id) = current_task_id else {
         return Ok(());
     };
-    let task = get_task(client, base, &task_id)?;
+    let mut task = get_task(client, base, &task_id)?;
+    if is_graph_node_task(&task) && task.lease_owner.as_deref() != Some(options.worker_id.as_str())
+    {
+        task = claim_next_task(client, base, &options.worker_id)?.with_context(|| {
+            format!("graph task {task_id} could not acquire a Coordinate lease")
+        })?;
+        if task.id != task_id || task.lease_owner.as_deref() != Some(options.worker_id.as_str()) {
+            bail!(
+                "worker {} acquired unexpected graph task {} while leasing {}",
+                options.worker_id,
+                task.id,
+                task_id
+            );
+        }
+    }
+    if is_graph_node_task(&task) && !runtime.board_checked_out_tasks.contains(&task_id) {
+        let checkout_result = checkout_graph_node(
+            client,
+            options.execution_graph_url.as_deref(),
+            &task,
+            &options.worker_id,
+        );
+        if let Err(error) = checkout_result {
+            release_task_claim(
+                client,
+                base,
+                &options.worker_id,
+                &task_id,
+                "execution graph checkout failed before execution",
+            )?;
+            return Err(error.context(format!(
+                "released Coordinate lease for graph task {task_id}"
+            )));
+        }
+        runtime.board_checked_out_tasks.insert(task_id.clone());
+    }
     if matches!(task.state.as_str(), "acked" | "working")
         && task.lease_owner.as_deref() == Some(options.worker_id.as_str())
     {
@@ -376,6 +451,15 @@ fn bridge_tick(
     if matches!(task.state.as_str(), "assigned" | "acked")
         && !runtime.delivered_tasks.contains(&task_id)
     {
+        if options.kind == "cursor"
+            && task.lease_owner.as_deref() != Some(options.worker_id.as_str())
+        {
+            bail!(
+                "cursor worker {} cannot execute task {} without owning its lease",
+                options.worker_id,
+                task.id
+            );
+        }
         inject_task_brief(&options.tmux_target, &task, &options.kind)?;
         runtime.delivered_tasks.insert(task_id.clone());
     }
@@ -396,6 +480,11 @@ fn bridge_tick(
                 }
             }
             PaneMarker::Report(report) => {
+                if is_graph_node_task(&task) && report.task_id.as_deref() != Some(task_id.as_str())
+                {
+                    runtime.completed_markers.insert(marker_key);
+                    return Ok(());
+                }
                 let latest = get_task(client, base, &task_id)?;
                 if latest.state == "assigned" {
                     post_empty(client, &format!("{base}/tasks/{task_id}/ack"))?;
@@ -409,13 +498,18 @@ fn bridge_tick(
                     &format!("{base}/tasks/{task_id}/report"),
                     &report,
                 )?;
-                http_json::<BridgeTaskRecord, _>(
-                    client,
-                    reqwest::Method::POST,
-                    &format!("{base}/tasks/{task_id}/verify"),
-                    &serde_json::json!({"summary": "host bridge report accepted"}),
-                )?;
-                post_empty(client, &format!("{base}/tasks/{task_id}/complete"))?;
+                if is_graph_node_task(&latest) {
+                    let outcome = verify_graph_node(options, &latest, &report)?;
+                    apply_graph_verification(client, base, options, runtime, &latest, &outcome)?;
+                } else {
+                    http_json::<BridgeTaskRecord, _>(
+                        client,
+                        reqwest::Method::POST,
+                        &format!("{base}/tasks/{task_id}/verify"),
+                        &serde_json::json!({"summary": "host bridge report accepted"}),
+                    )?;
+                    post_empty(client, &format!("{base}/tasks/{task_id}/complete"))?;
+                }
             }
             PaneMarker::Failed(reason) => fail_task(client, base, &task_id, false, &reason)?,
             PaneMarker::Blocked(reason) => fail_task(client, base, &task_id, true, &reason)?,
@@ -429,7 +523,10 @@ impl PaneMarker {
     fn dedupe_key(&self, task_id: &str) -> String {
         match self {
             PaneMarker::Ack(acked_task_id) => format!("ack:{acked_task_id}"),
-            PaneMarker::Report(_) => format!("report:{task_id}"),
+            PaneMarker::Report(report) => {
+                let encoded = serde_json::to_vec(report).unwrap_or_default();
+                format!("report:{task_id}:{:x}", Sha256::digest(encoded))
+            }
             PaneMarker::Failed(reason) => format!("failed:{task_id}:{reason}"),
             PaneMarker::Blocked(reason) => format!("blocked:{task_id}:{reason}"),
         }
@@ -468,7 +565,7 @@ Acceptance criteria:
 For long work, keep making progress. The host bridge renews your lease while this pane is active; if the pane dies or stops responding, Coordinate will return the task to the shared queue.
 
 When finished, print exactly one line beginning with COORDINATE_REPORT_JSON: followed by JSON with:
-summary, filesInspected, changedFiles, testsRun, verification, risks, rawReport.
+taskId (exactly "{task_id}"), summary, filesInspected, changedFiles, testsRun, verification, risks, rawReport.
 
 	If blocked, print COORDINATE_BLOCKED: <reason>.
 	If failed, print COORDINATE_FAILED: <reason>.
@@ -495,6 +592,26 @@ summary, filesInspected, changedFiles, testsRun, verification, risks, rawReport.
 }
 
 pub fn parse_latest_marker(output: &str) -> Result<Option<PaneMarker>> {
+    if let Some(marker) = parse_latest_text_marker(output)? {
+        return Ok(Some(marker));
+    }
+
+    for line in output.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let mut strings = Vec::new();
+        collect_json_strings(&value, &mut strings);
+        for text in strings.into_iter().rev() {
+            if let Some(marker) = parse_latest_text_marker(text)? {
+                return Ok(Some(marker));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_latest_text_marker(output: &str) -> Result<Option<PaneMarker>> {
     let lines = output.lines().collect::<Vec<_>>();
     for index in (0..lines.len()).rev() {
         let line = lines[index].trim();
@@ -502,8 +619,9 @@ pub fn parse_latest_marker(output: &str) -> Result<Option<PaneMarker>> {
             if !raw.trim_start().starts_with('{') {
                 continue;
             }
-            let report = parse_wrapped_report(raw, &lines[index + 1..])?;
-            return Ok(Some(PaneMarker::Report(report)));
+            if let Ok(report) = parse_wrapped_report(raw, &lines[index + 1..]) {
+                return Ok(Some(PaneMarker::Report(report)));
+            }
         }
     }
 
@@ -522,6 +640,23 @@ pub fn parse_latest_marker(output: &str) -> Result<Option<PaneMarker>> {
     Ok(None)
 }
 
+fn collect_json_strings<'a>(value: &'a serde_json::Value, output: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(value) => output.push(value),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_strings(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_strings(value, output);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn marker_suffix<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     let normalized = line
         .trim_start()
@@ -537,7 +672,9 @@ fn parse_wrapped_report(raw: &str, following_lines: &[&str]) -> Result<BridgeTas
         return Ok(report);
     }
 
-    for line in following_lines.iter().take(20) {
+    // Interactive UIs wrap long evidence reports across many physical pane
+    // lines. Keep the scan bounded, but large enough for realistic reports.
+    for line in following_lines.iter().take(200) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -582,6 +719,8 @@ fn register_worker(
             metadata: serde_json::json!({
                 "hostBridge": true,
                 "tmuxTarget": options.tmux_target,
+                "evidenceFormat": if options.kind == "cursor" { "stream-json" } else { "tmux-pane" },
+                "sandbox": if options.kind == "cursor" { "enabled" } else { "provider-default" },
             })
             .to_string(),
         },
@@ -670,6 +809,196 @@ fn fail_task(
             blocked,
         },
     )?;
+    Ok(())
+}
+
+fn release_task_claim(
+    client: &Client,
+    base: &str,
+    worker_id: &str,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let _: BridgeTaskRecord = http_json(
+        client,
+        reqwest::Method::POST,
+        &format!("{base}/tasks/{task_id}/release-claim"),
+        &ReleaseTaskClaimRequest {
+            worker_id: worker_id.to_string(),
+            reason: reason.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn is_graph_node_task(task: &BridgeTaskRecord) -> bool {
+    task.source_prd_path.starts_with("fractal-graph:")
+}
+
+fn checkout_graph_node(
+    client: &Client,
+    execution_graph_url: Option<&str>,
+    task: &BridgeTaskRecord,
+    worker_id: &str,
+) -> Result<()> {
+    if !is_graph_node_task(task) {
+        return Ok(());
+    }
+    let node_id = task
+        .source_task_number
+        .as_deref()
+        .context("compiled graph task is missing its node id")?;
+    let base = execution_graph_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .context("compiled graph task requires executionGraphUrl")?;
+    let mut url = reqwest::Url::parse(base)
+        .with_context(|| format!("invalid execution graph URL: {base}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("execution graph URL cannot be a base"))?;
+        segments.pop_if_empty();
+        segments.extend(["api", "tasks", node_id, "checkout"]);
+    }
+    let response = client
+        .post(url.clone())
+        .json(&GraphCheckoutRequest {
+            agent_id: worker_id.to_string(),
+            agent_label: format!("Coordinate · {worker_id}"),
+        })
+        .send()
+        .with_context(|| format!("failed to check out graph node {node_id}"))?;
+    ensure_success(response, url.as_str())?;
+    Ok(())
+}
+
+fn verify_graph_node(
+    options: &HostBridgeOptions,
+    task: &BridgeTaskRecord,
+    report: &BridgeTaskReport,
+) -> Result<VerificationOutcome> {
+    let config = options
+        .node_verifier
+        .as_ref()
+        .context("compiled graph task requires nodeVerifier configuration")?;
+    let node_id = task
+        .source_task_number
+        .as_deref()
+        .context("compiled graph task is missing its node id")?;
+    run_node_verifier(
+        config,
+        &NodeVerificationRequest {
+            task_id: &task.id,
+            node_id,
+            acceptance_criteria: &task.acceptance_criteria,
+            report,
+        },
+    )
+}
+
+fn apply_graph_verification(
+    client: &Client,
+    base: &str,
+    options: &HostBridgeOptions,
+    runtime: &mut BridgeRuntimeState,
+    task: &BridgeTaskRecord,
+    outcome: &VerificationOutcome,
+) -> Result<()> {
+    match outcome.decision {
+        VerificationDecision::Complete => {
+            http_json::<BridgeTaskRecord, _>(
+                client,
+                reqwest::Method::POST,
+                &format!("{base}/tasks/{}/verify", task.id),
+                &serde_json::json!({
+                    "summary": outcome.summary,
+                    "decision": "complete",
+                    "evidenceHash": outcome.evidence_hash,
+                    "evidence": outcome.evidence,
+                }),
+            )?;
+            update_graph_node(
+                client,
+                options.execution_graph_url.as_deref(),
+                task,
+                &options.worker_id,
+                "complete",
+            )?;
+            post_empty(client, &format!("{base}/tasks/{}/complete", task.id))?;
+        }
+        VerificationDecision::Retry => {
+            update_graph_node(
+                client,
+                options.execution_graph_url.as_deref(),
+                task,
+                &options.worker_id,
+                "release",
+            )?;
+            runtime.board_checked_out_tasks.remove(&task.id);
+            let rejected: BridgeTaskRecord = http_json(
+                client,
+                reqwest::Method::POST,
+                &format!("{base}/tasks/{}/reject", task.id),
+                &RetryTaskRequest {
+                    reason: outcome.summary.clone(),
+                },
+            )?;
+            if rejected.state == "queued" {
+                runtime.delivered_tasks.remove(&task.id);
+            }
+        }
+        VerificationDecision::Escalate => {
+            update_graph_node(
+                client,
+                options.execution_graph_url.as_deref(),
+                task,
+                &options.worker_id,
+                "release",
+            )?;
+            runtime.board_checked_out_tasks.remove(&task.id);
+            fail_task(client, base, &task.id, true, &outcome.summary)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_graph_node(
+    client: &Client,
+    execution_graph_url: Option<&str>,
+    task: &BridgeTaskRecord,
+    worker_id: &str,
+    action: &str,
+) -> Result<()> {
+    if !matches!(action, "complete" | "release") {
+        bail!("unsupported execution graph action: {action}");
+    }
+    let node_id = task
+        .source_task_number
+        .as_deref()
+        .context("compiled graph task is missing its node id")?;
+    let base = execution_graph_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .context("compiled graph task requires executionGraphUrl")?;
+    let mut url = reqwest::Url::parse(base)
+        .with_context(|| format!("invalid execution graph URL: {base}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("execution graph URL cannot be a base"))?;
+        segments.pop_if_empty();
+        segments.extend(["api", "tasks", node_id, action]);
+    }
+    let response = client
+        .post(url.clone())
+        .json(&GraphCheckoutRequest {
+            agent_id: worker_id.to_string(),
+            agent_label: format!("Coordinate · {worker_id}"),
+        })
+        .send()
+        .with_context(|| format!("failed to {action} graph node {node_id}"))?;
+    ensure_success(response, url.as_str())?;
     Ok(())
 }
 
@@ -796,6 +1125,7 @@ fn default_worker_command(kind: &str) -> String {
     match kind {
         "claude" => "claude --dangerously-skip-permissions".to_string(),
         "codex" => "codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen".to_string(),
+        "cursor" => "$SHELL".to_string(),
         "openrouter" => "squad openrouter-worker".to_string(),
         "local" => "squad local-worker".to_string(),
         "manual" => "$SHELL".to_string(),
@@ -847,7 +1177,12 @@ fn capture_tmux_pane(target: &str, lines: usize) -> Result<String> {
 }
 
 fn inject_task_brief(target: &str, task: &BridgeTaskRecord, kind: &str) -> Result<()> {
-    let text = render_task_injection(task);
+    let prompt = render_task_injection(task);
+    let text = if kind == "cursor" {
+        cursor_worker_command(&prompt)
+    } else {
+        prompt
+    };
     let mut load = Command::new("tmux")
         .args(["load-buffer", "-"])
         .stdin(std::process::Stdio::piped())
@@ -893,6 +1228,31 @@ fn inject_task_brief(target: &str, task: &BridgeTaskRecord, kind: &str) -> Resul
     Ok(())
 }
 
+/// Render the Cursor worker invocation for a leased node execution.
+///
+/// Cursor is an *interchangeable worker*: this renders the headless,
+/// sandboxed execute-only invocation (`cursor-agent -p …`) used by the real
+/// injection path, and deliberately carries no planning/intent mode — Cursor
+/// executes the leased node and never drives the pipeline. Exposed so the P3.4
+/// interchangeability proof can assert the execution-only contract offline.
+pub fn cursor_worker_command(prompt: &str) -> String {
+    // This command is pasted into a plain interactive shell. Keep it on one
+    // physical line so embedded prompt newlines cannot enter the shell's quote
+    // continuation mode before the closing quote arrives.
+    let prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "cursor-agent -p --output-format stream-json --sandbox enabled --trust {}",
+        shell_quote(&prompt)
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn validate_options(options: &HostBridgeOptions) -> Result<()> {
     if options.service_url.trim().is_empty() {
         bail!("--service-url cannot be empty");
@@ -927,6 +1287,8 @@ fn validate_options(options: &HostBridgeOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn parses_latest_report_marker() {
@@ -938,6 +1300,7 @@ COORDINATE_REPORT_JSON: {"summary":"done","filesInspected":["src/main.rs"],"chan
         assert_eq!(
             marker,
             PaneMarker::Report(BridgeTaskReport {
+                task_id: None,
                 summary: "done".to_string(),
                 files_inspected: vec!["src/main.rs".to_string()],
                 changed_files: vec!["src/main.rs".to_string()],
@@ -947,6 +1310,19 @@ COORDINATE_REPORT_JSON: {"summary":"done","filesInspected":["src/main.rs"],"chan
                 raw_report: "ok".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parses_task_bound_report_and_skips_newer_malformed_candidate() {
+        let output = r#"
+COORDINATE_REPORT_JSON: {"taskId":"graph-node:one","summary":"done","filesInspected":[],"changedFiles":[],"testsRun":["test"],"verification":"passed","risks":"none","rawReport":"ok"}
+COORDINATE_REPORT_JSON: {"summary":"unterminated
+"#;
+        let marker = parse_latest_marker(output).unwrap().unwrap();
+        let PaneMarker::Report(report) = marker else {
+            panic!("expected report marker");
+        };
+        assert_eq!(report.task_id.as_deref(), Some("graph-node:one"));
     }
 
     #[test]
@@ -962,6 +1338,7 @@ COORDINATE_REPORT_JSON: {"summary":"done","filesInspected":["src/main.rs"],"chan
         assert_eq!(
             marker,
             PaneMarker::Report(BridgeTaskReport {
+                task_id: None,
                 summary: "Acknowledged task as requested; no files inspected or changed."
                     .to_string(),
                 files_inspected: vec![],
@@ -984,6 +1361,7 @@ COORDINATE_REPORT_JSON: {"summary":"done","filesInspected":["src/main.rs"],"chan
         assert_eq!(
             marker,
             PaneMarker::Report(BridgeTaskReport {
+                task_id: None,
                 summary: "done".to_string(),
                 files_inspected: vec![],
                 changed_files: vec![],
@@ -991,6 +1369,31 @@ COORDINATE_REPORT_JSON: {"summary":"done","filesInspected":["src/main.rs"],"chan
                 verification: "passed".to_string(),
                 risks: String::new(),
                 raw_report: "ok".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_cursor_stream_json_report_marker() {
+        let output = serde_json::json!({
+            "type": "result",
+            "result": "Work complete.\nCOORDINATE_REPORT_JSON: {\"summary\":\"done\",\"filesInspected\":[\"src/main.rs\"],\"changedFiles\":[\"src/main.rs\"],\"testsRun\":[\"cargo test\"],\"verification\":\"passed\",\"risks\":\"none\",\"rawReport\":\"cursor stream evidence\"}"
+        })
+        .to_string();
+
+        let marker = parse_latest_marker(&output).unwrap().unwrap();
+
+        assert_eq!(
+            marker,
+            PaneMarker::Report(BridgeTaskReport {
+                task_id: None,
+                summary: "done".to_string(),
+                files_inspected: vec!["src/main.rs".to_string()],
+                changed_files: vec!["src/main.rs".to_string()],
+                tests_run: vec!["cargo test".to_string()],
+                verification: "passed".to_string(),
+                risks: "none".to_string(),
+                raw_report: "cursor stream evidence".to_string(),
             })
         );
     }
@@ -1050,12 +1453,17 @@ If failed, print COORDINATE_FAILED: <reason>.
     }
 
     #[test]
-    fn config_expands_codex_and_claude_workers_with_defaults() {
+    fn config_expands_provider_workers_with_defaults() {
         let config: HostBridgeConfig = toml::from_str(
             r#"
 serviceUrl = "http://127.0.0.1:8787"
 tmuxSessionPrefix = "bridge"
 startupTimeoutSecs = 12
+
+[nodeVerifier]
+program = "dataevol-node-verifier"
+minVerifiers = 2
+requireHiddenRegression = true
 
 [[workers]]
 id = "codex-1"
@@ -1065,11 +1473,15 @@ kind = "codex"
 id = "claude-1"
 kind = "claude"
 role = "coding_worker"
+
+[[workers]]
+id = "cursor-1"
+kind = "cursor"
 "#,
         )
         .unwrap();
         let options = config.to_options(true).unwrap();
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 3);
         assert_eq!(options[0].tmux_target, "bridge-codex-1");
         assert_eq!(
             options[0].command,
@@ -1077,6 +1489,102 @@ role = "coding_worker"
         );
         assert_eq!(options[0].readiness_timeout_secs, 12);
         assert_eq!(options[1].command, "claude --dangerously-skip-permissions");
+        assert_eq!(options[2].command, "$SHELL");
+        assert_eq!(
+            options[0].execution_graph_url.as_deref(),
+            Some("http://127.0.0.1:8091")
+        );
+        let verifier = options[0].node_verifier.as_ref().unwrap();
+        assert_eq!(verifier.program, "dataevol-node-verifier");
+        assert_eq!(verifier.min_verifiers, Some(2));
+    }
+
+    #[test]
+    fn graph_node_checkout_posts_worker_ownership_before_execution() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.starts_with("POST /api/tasks/implement/checkout HTTP/1.1"));
+            assert!(request.contains(r#""agent_id":"cursor-1""#));
+            assert!(request.contains(r#""agent_label":"Coordinate · cursor-1""#));
+            let body = r#"{"ok":true}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let client = build_client(None).unwrap();
+        let task = BridgeTaskRecord {
+            id: "graph-task-1".to_string(),
+            title: "Implement".to_string(),
+            description: "Execute node".to_string(),
+            acceptance_criteria: vec!["done".to_string()],
+            state: "acked".to_string(),
+            preferred_model: "cursor".to_string(),
+            source_prd_path: "fractal-graph:graph:test:sha256:abc".to_string(),
+            source_task_number: Some("implement".to_string()),
+            scheduling_pool: "cursor".to_string(),
+            estimated_size: "small".to_string(),
+            claude_suitable: false,
+            assigned_worker_id: Some("cursor-1".to_string()),
+            lease_owner: Some("cursor-1".to_string()),
+            lease_expires_at: Some("2026-07-23T15:00:00Z".to_string()),
+            claimed_at: Some("2026-07-23T14:45:00Z".to_string()),
+        };
+
+        checkout_graph_node(
+            &client,
+            Some(&format!("http://{address}")),
+            &task,
+            "cursor-1",
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn graph_node_checkout_fails_closed_without_board_url() {
+        let client = build_client(None).unwrap();
+        let task = BridgeTaskRecord {
+            id: "graph-task-1".to_string(),
+            title: "Implement".to_string(),
+            description: "Execute node".to_string(),
+            acceptance_criteria: Vec::new(),
+            state: "acked".to_string(),
+            preferred_model: "codex".to_string(),
+            source_prd_path: "fractal-graph:graph:test:sha256:abc".to_string(),
+            source_task_number: Some("implement".to_string()),
+            scheduling_pool: "codex".to_string(),
+            estimated_size: "small".to_string(),
+            claude_suitable: false,
+            assigned_worker_id: Some("codex-1".to_string()),
+            lease_owner: Some("codex-1".to_string()),
+            lease_expires_at: None,
+            claimed_at: None,
+        };
+
+        assert!(checkout_graph_node(&client, None, &task, "codex-1")
+            .unwrap_err()
+            .to_string()
+            .contains("executionGraphUrl"));
+    }
+
+    #[test]
+    fn cursor_worker_command_is_sandboxed_stream_json_and_shell_quoted() {
+        let command = cursor_worker_command("Task lease: cursor-1:task-1\nDon't escape");
+
+        assert!(command
+            .starts_with("cursor-agent -p --output-format stream-json --sandbox enabled --trust "));
+        assert!(command.contains("Task lease: cursor-1:task-1"));
+        assert!(command.contains(r#"Don'\''t escape"#));
+        assert!(!command.contains('\n'));
     }
 
     #[test]

@@ -276,6 +276,23 @@ pub struct ServiceTaskReportInput {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceTaskProgressInput {
     pub summary: String,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub evidence_hash: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTaskVerificationRecord {
+    pub task_id: String,
+    pub summary: String,
+    pub decision: String,
+    pub evidence_hash: String,
+    pub evidence: serde_json::Value,
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -582,6 +599,14 @@ impl Store {
                  verification TEXT NOT NULL,
                  risks TEXT NOT NULL,
                  raw_report TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS service_task_verifications (
+                 task_id TEXT PRIMARY KEY,
+                 summary TEXT NOT NULL,
+                 decision TEXT NOT NULL,
+                 evidence_hash TEXT NOT NULL,
+                 evidence TEXT NOT NULL,
                  created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS service_prds (
@@ -2263,6 +2288,15 @@ impl Store {
     }
 
     pub fn service_create_task(&self, input: ServiceTaskInput) -> Result<ServiceTaskRecord> {
+        self.service_create_task_with_id(uuid::Uuid::new_v4().to_string(), input)
+    }
+
+    pub(crate) fn service_create_task_with_id(
+        &self,
+        id: String,
+        input: ServiceTaskInput,
+    ) -> Result<ServiceTaskRecord> {
+        let id = required_service_field("task id", &id)?;
         let title = required_service_field("task title", &input.title)?;
         let description = required_service_field("task description", &input.description)?;
         let source_prd_path = required_service_field("source PRD path", &input.source_prd_path)?;
@@ -2291,7 +2325,6 @@ impl Store {
         let scheduling =
             service_task_scheduling_metadata(&preferred_model, &description, &acceptance_criteria);
         let eligible_providers = normalize_service_provider_lane(Some(&scheduling.pool));
-        let id = uuid::Uuid::new_v4().to_string();
         let now = service_now();
         self.conn.execute(
             "INSERT INTO service_tasks (
@@ -2539,6 +2572,51 @@ impl Store {
             Some(worker_id),
             Some(task_id),
             &serde_json::json!({"lease_expires_at": lease_expires_at}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    /// Release a pull-queue lease that could not acquire its external graph
+    /// checkout. This does not consume a retry attempt because execution never
+    /// started.
+    pub fn service_release_task_claim(
+        &self,
+        worker_id: &str,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<ServiceTaskRecord> {
+        let reason = redact_report_text(&required_service_field("release reason", reason)?);
+        let task = self.require_service_task(task_id)?;
+        if task.lease_owner.as_deref() != Some(worker_id) || task.state != TASK_STATE_ACKED {
+            anyhow::bail!("service task {task_id} is not leased by {worker_id}");
+        }
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks
+             SET state = ?1,
+                 assigned_worker_id = NULL,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 acked_at = NULL,
+                 started_at = NULL,
+                 retry_reason = ?2,
+                 last_error = ?2,
+                 updated_at = ?3
+             WHERE id = ?4 AND lease_owner = ?5 AND state = 'acked'",
+            params![TASK_STATE_QUEUED, reason, now, task_id, worker_id],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.conn.execute(
+            "UPDATE service_workers
+             SET status = ?1, current_task_id = NULL, updated_at = ?2
+             WHERE id = ?3 AND current_task_id = ?4",
+            params![WORKER_STATE_READY, now, worker_id, task_id],
+        )?;
+        self.service_record_event(
+            "task.claim_released",
+            Some(worker_id),
+            Some(task_id),
+            &serde_json::json!({"reason": reason}),
         )?;
         self.require_service_task(task_id)
     }
@@ -3000,6 +3078,39 @@ impl Store {
             "verification summary",
             &input.summary,
         )?);
+        if let Some(decision) = input.decision.as_deref() {
+            let decision = required_service_field("verification decision", decision)?;
+            if decision != "complete" {
+                anyhow::bail!("service task {task_id} cannot be verified with decision {decision}");
+            }
+            let evidence_hash = required_service_field(
+                "verification evidence hash",
+                input.evidence_hash.as_deref().unwrap_or_default(),
+            )?;
+            let evidence = input
+                .evidence
+                .as_ref()
+                .with_context(|| "verification evidence is required with a decision")?;
+            self.conn.execute(
+                "INSERT INTO service_task_verifications (
+                    task_id, summary, decision, evidence_hash, evidence, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                    summary = excluded.summary,
+                    decision = excluded.decision,
+                    evidence_hash = excluded.evidence_hash,
+                    evidence = excluded.evidence,
+                    created_at = excluded.created_at",
+                params![
+                    task_id,
+                    summary,
+                    decision,
+                    evidence_hash,
+                    serde_json::to_string(evidence)?,
+                    service_now()
+                ],
+            )?;
+        }
         let now = service_now();
         let updated = self.conn.execute(
             "UPDATE service_tasks
@@ -3012,9 +3123,40 @@ impl Store {
             "task.verified",
             task.assigned_worker_id.as_deref(),
             Some(task_id),
-            &serde_json::json!({"summary": summary}),
+            &serde_json::json!({
+                "summary": summary,
+                "decision": input.decision,
+                "evidenceHash": input.evidence_hash
+            }),
         )?;
         self.require_service_task(task_id)
+    }
+
+    pub fn service_get_task_verification(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<ServiceTaskVerificationRecord>> {
+        self.conn
+            .query_row(
+                "SELECT task_id, summary, decision, evidence_hash, evidence, created_at
+                 FROM service_task_verifications
+                 WHERE task_id = ?1",
+                [task_id],
+                |row| {
+                    let evidence: String = row.get(4)?;
+                    Ok(ServiceTaskVerificationRecord {
+                        task_id: row.get(0)?,
+                        summary: row.get(1)?,
+                        decision: row.get(2)?,
+                        evidence_hash: row.get(3)?,
+                        evidence: serde_json::from_str(&evidence)
+                            .unwrap_or(serde_json::Value::Null),
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn service_complete_task(&self, task_id: &str) -> Result<ServiceTaskRecord> {
@@ -3107,12 +3249,14 @@ impl Store {
         let now = service_now();
         let updated = self.conn.execute(
             "UPDATE service_tasks
-	             SET state = ?1,
-	                 failure_reason = ?2,
-	                 retry_count = retry_count + 1,
-	                 attempt = attempt + 1,
-	                 last_error = ?2,
-	                 updated_at = ?3
+             SET state = ?1,
+                 failure_reason = ?2,
+                 retry_count = retry_count + 1,
+                 attempt = attempt + 1,
+                 last_error = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?3
 	             WHERE id = ?4",
             params![new_state, reason, now, task_id],
         )?;
@@ -3155,11 +3299,14 @@ impl Store {
             "UPDATE service_tasks
 	             SET state = ?1,
 	                 assigned_worker_id = NULL,
-	                 retry_count = retry_count + 1,
-	                 attempt = attempt + 1,
-	                 retry_reason = ?2,
-	                 last_error = ?2,
-	                 updated_at = ?3
+                 retry_count = retry_count + 1,
+                 attempt = attempt + 1,
+                 retry_reason = ?2,
+                 last_error = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 claimed_at = NULL,
+                 updated_at = ?3
 	             WHERE id = ?4",
             params![TASK_STATE_QUEUED, reason, now, task_id],
         )?;
@@ -3179,6 +3326,22 @@ impl Store {
             &serde_json::json!({"reason": reason}),
         )?;
         self.require_service_task(task_id)
+    }
+
+    /// Retry a verifier-rejected task while budget remains, otherwise escalate
+    /// it to a terminal blocked state. This keeps the decision next to the
+    /// persisted attempt counter instead of trusting a host-side snapshot.
+    pub fn service_reject_task(&self, task_id: &str, reason: &str) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if task.attempt >= task.max_attempts {
+            self.service_fail_task(
+                task_id,
+                true,
+                &format!("verification retries exhausted: {reason}"),
+            )
+        } else {
+            self.service_retry_task(task_id, reason)
+        }
     }
 
     pub fn service_requeue_stale_tasks(
@@ -3787,9 +3950,9 @@ fn required_service_field(field: &str, value: &str) -> Result<String> {
 fn normalized_worker_kind(value: &str) -> Result<String> {
     let value = value.trim().to_ascii_lowercase();
     match value.as_str() {
-        "codex" | "claude" | "openrouter" | "local" | "manual" => Ok(value),
+        "codex" | "claude" | "cursor" | "openrouter" | "local" | "manual" => Ok(value),
         _ => anyhow::bail!(
-            "invalid service worker kind '{value}'. Expected codex, claude, openrouter, local, or manual"
+            "invalid service worker kind '{value}'. Expected codex, claude, cursor, openrouter, local, or manual"
         ),
     }
 }

@@ -6,7 +6,18 @@
 //! state and evidence-chain endpoints; raw model and container logs are not an
 //! adapter input.
 
-use std::{error::Error, fmt, path::Path};
+use std::{
+    error::Error,
+    fmt,
+    path::Path,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+#[cfg(unix)]
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -88,6 +99,8 @@ pub struct FractalRuntimeJob {
     pub work_hash: String,
     /// FractalWork graph identifier.
     pub graph_id: String,
+    /// Graph node authorized by the signed work lease.
+    pub graph_node_id: String,
     /// Canonical compiled graph hash.
     pub graph_hash: String,
     /// Provider node authorized by the signed lease.
@@ -125,6 +138,145 @@ pub struct FractaldRequest {
     pub body: Value,
 }
 
+/// Transport-neutral daemon response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FractaldResponse {
+    /// HTTP status returned by `fractald`.
+    pub status: u16,
+    /// Parsed JSON response body.
+    pub body: Value,
+}
+
+/// One self-contained admission document accepted by the Coordinate runner.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeJobSubmission {
+    /// Durable Coordinate correlation record.
+    pub job: FractalRuntimeJob,
+    /// Signed `fractal.work_lease.v1` envelope.
+    pub signed_lease: Value,
+    /// Compiled `fractal.execution_graph.v1`.
+    pub graph_json: Value,
+    /// Compiler identity pinned into daemon admission.
+    pub compiler_version: String,
+}
+
+/// Minimal request boundary used by the poll loop and deterministic tests.
+pub trait FractaldTransport {
+    /// Execute one typed daemon request.
+    fn execute(&self, request: &FractaldRequest) -> Result<FractaldResponse, RuntimeAdapterError>;
+}
+
+/// Blocking HTTP transport for a `fractald` API endpoint.
+pub struct HttpFractaldClient {
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl HttpFractaldClient {
+    /// Construct a client without accepting URL paths, queries, or credentials
+    /// in the configured daemon origin.
+    pub fn new(base_url: &str) -> Result<Self, RuntimeAdapterError> {
+        let base_url = base_url.trim().trim_end_matches('/');
+        let parsed = reqwest::Url::parse(base_url)
+            .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+        {
+            return Err(RuntimeAdapterError::InvalidRecord(
+                "fractald URL must be an http(s) origin without credentials, path, query, or fragment"
+                    .to_string(),
+            ));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+        Ok(Self {
+            base_url: base_url.to_string(),
+            client,
+        })
+    }
+}
+
+impl FractaldTransport for HttpFractaldClient {
+    fn execute(&self, request: &FractaldRequest) -> Result<FractaldResponse, RuntimeAdapterError> {
+        let url = format!("{}{}", self.base_url, request.path);
+        let response = match request.method.as_str() {
+            "GET" => self.client.get(url).send(),
+            "POST" => self.client.post(url).json(&request.body).send(),
+            method => {
+                return Err(RuntimeAdapterError::InvalidRecord(format!(
+                    "unsupported fractald method {method}"
+                )))
+            }
+        }
+        .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .json::<Value>()
+            .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+        Ok(FractaldResponse { status, body })
+    }
+}
+
+/// Native transport for the private newline-delimited JSON Unix socket exposed
+/// by `fractald`. Each request uses a fresh authenticated local connection.
+pub struct UdsFractaldClient {
+    socket_path: std::path::PathBuf,
+}
+
+impl UdsFractaldClient {
+    /// Point the client at the daemon's protected socket.
+    pub fn new(socket_path: impl Into<std::path::PathBuf>) -> Result<Self, RuntimeAdapterError> {
+        let socket_path = socket_path.into();
+        if !socket_path.is_absolute() {
+            return Err(RuntimeAdapterError::InvalidRecord(
+                "fractald socket path must be absolute".to_string(),
+            ));
+        }
+        Ok(Self { socket_path })
+    }
+}
+
+impl FractaldTransport for UdsFractaldClient {
+    fn execute(&self, request: &FractaldRequest) -> Result<FractaldResponse, RuntimeAdapterError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (request, &self.socket_path);
+            return Err(RuntimeAdapterError::Transport(
+                "fractald Unix socket transport is unavailable on this platform".to_string(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let mut stream = UnixStream::connect(&self.socket_path)
+                .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+            serde_json::to_writer(&mut stream, request)
+                .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+            stream
+                .write_all(b"\n")
+                .and_then(|()| stream.flush())
+                .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))?;
+            if line.trim().is_empty() {
+                return Err(RuntimeAdapterError::Transport(
+                    "fractald closed the socket without a response".to_string(),
+                ));
+            }
+            serde_json::from_str(&line)
+                .map_err(|error| RuntimeAdapterError::Transport(error.to_string()))
+        }
+    }
+}
+
 /// Fail-closed adapter or persistence error.
 #[derive(Debug)]
 pub enum RuntimeAdapterError {
@@ -136,6 +288,8 @@ pub enum RuntimeAdapterError {
     IdentityMismatch(String),
     /// A checkpoint was supplied outside an interrupted lifecycle.
     CheckpointNotResumable,
+    /// HTTP transport or response decoding failed.
+    Transport(String),
     /// SQLite persistence failed.
     Storage(rusqlite::Error),
 }
@@ -153,6 +307,7 @@ impl fmt::Display for RuntimeAdapterError {
             Self::CheckpointNotResumable => {
                 formatter.write_str("resume checkpoint requires interrupted runtime state")
             }
+            Self::Transport(message) => write!(formatter, "fractald transport failed: {message}"),
             Self::Storage(error) => write!(formatter, "runtime job storage failed: {error}"),
         }
     }
@@ -178,6 +333,7 @@ impl FractalRuntimeJob {
             ("coordinate_job_id", self.coordinate_job_id.as_str()),
             ("work_id", self.work_id.as_str()),
             ("graph_id", self.graph_id.as_str()),
+            ("graph_node_id", self.graph_node_id.as_str()),
             ("provider_node", self.provider_node.as_str()),
             ("local_execution_id", self.local_execution_id.as_str()),
             ("resource_class", self.resource_class.as_str()),
@@ -220,6 +376,7 @@ impl FractalRuntimeJob {
                 "admission requires signed lease, graph object, and compiler version".to_string(),
             ));
         }
+        self.validate_admission_binding(&signed_lease, &graph_json)?;
         Ok(FractaldRequest {
             method: "POST".to_string(),
             path: "/v1/work/admit".to_string(),
@@ -232,6 +389,70 @@ impl FractalRuntimeJob {
                 "compiler_version": compiler_version,
             }),
         })
+    }
+
+    fn validate_admission_binding(
+        &self,
+        signed_lease: &Value,
+        graph_json: &Value,
+    ) -> Result<(), RuntimeAdapterError> {
+        let lease = signed_lease
+            .get("lease")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                RuntimeAdapterError::InvalidRecord(
+                    "signed lease must contain a lease object".to_string(),
+                )
+            })?;
+        for (field, expected) in [
+            ("schema", "fractal.work_lease.v1"),
+            ("work_hash", self.work_hash.as_str()),
+            ("graph_hash", self.graph_hash.as_str()),
+            ("node_id", self.graph_node_id.as_str()),
+            ("provider_node", self.provider_node.as_str()),
+        ] {
+            if lease.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(RuntimeAdapterError::IdentityMismatch(format!(
+                    "signed lease {field}"
+                )));
+            }
+        }
+        if lease.get("expires_at_ms").and_then(Value::as_u64) != Some(self.lease_expires_at_ms) {
+            return Err(RuntimeAdapterError::IdentityMismatch(
+                "signed lease expires_at_ms".to_string(),
+            ));
+        }
+        for field in ["lease_id", "nonce", "issuer"] {
+            if lease
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(RuntimeAdapterError::InvalidRecord(format!(
+                    "signed lease {field} must be non-empty"
+                )));
+            }
+        }
+        if signed_lease
+            .get("signature_algorithm")
+            .and_then(Value::as_str)
+            != Some("ed25519")
+        {
+            return Err(RuntimeAdapterError::InvalidRecord(
+                "signed lease signature_algorithm must be ed25519".to_string(),
+            ));
+        }
+        validate_lower_hex_field(signed_lease, "issuer_public_key", 64)?;
+        validate_lower_hex_field(signed_lease, "signature", 128)?;
+        if graph_json.get("schema").and_then(Value::as_str) != Some("fractal.execution_graph.v1")
+            || graph_json.get("graph_hash").and_then(Value::as_str)
+                != Some(self.graph_hash.as_str())
+        {
+            return Err(RuntimeAdapterError::IdentityMismatch(
+                "compiled graph schema or graph_hash".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Build the durable state poll. No raw-log endpoint is used.
@@ -455,6 +676,65 @@ impl RuntimeJobStore {
     }
 }
 
+/// Admit one signed graph and durably poll state until a terminal lifecycle or
+/// the caller's bounded poll count. Terminal jobs also fetch and verify the
+/// append-only evidence chain before returning.
+pub fn run_runtime_job(
+    transport: &impl FractaldTransport,
+    store: &RuntimeJobStore,
+    submission: RuntimeJobSubmission,
+    poll_interval: Duration,
+    max_polls: usize,
+) -> Result<FractalRuntimeJob, RuntimeAdapterError> {
+    if max_polls == 0 {
+        return Err(RuntimeAdapterError::InvalidRecord(
+            "max_polls must be positive".to_string(),
+        ));
+    }
+    let RuntimeJobSubmission {
+        mut job,
+        signed_lease,
+        graph_json,
+        compiler_version,
+    } = submission;
+    let admission =
+        transport.execute(&job.admit_request(signed_lease, graph_json, &compiler_version)?)?;
+    job.apply_status_response(admission.status, &admission.body, unix_time_ms()?)?;
+    store.put(&job)?;
+
+    for poll_index in 0..max_polls {
+        let response = transport.execute(&job.poll_request()?)?;
+        job.apply_status_response(response.status, &response.body, unix_time_ms()?)?;
+        store.put(&job)?;
+        if runtime_state_is_terminal(job.runtime_state) {
+            let evidence = transport.execute(&job.evidence_request()?)?;
+            job.apply_evidence_response(evidence.status, &evidence.body, unix_time_ms()?)?;
+            store.put(&job)?;
+            return Ok(job);
+        }
+        if poll_index + 1 < max_polls && !poll_interval.is_zero() {
+            thread::sleep(poll_interval);
+        }
+    }
+    Ok(job)
+}
+
+fn runtime_state_is_terminal(state: RuntimeJobState) -> bool {
+    matches!(
+        state,
+        RuntimeJobState::Cancelled | RuntimeJobState::Completed | RuntimeJobState::Failed
+    )
+}
+
+fn unix_time_ms() -> Result<u64, RuntimeAdapterError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RuntimeAdapterError::InvalidRecord(error.to_string()))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| RuntimeAdapterError::InvalidRecord("system time exceeds u64".to_string()))
+}
+
 fn ensure_same_identity(
     previous: &FractalRuntimeJob,
     current: &FractalRuntimeJob,
@@ -463,6 +743,10 @@ fn ensure_same_identity(
         ("work_id", previous.work_id == current.work_id),
         ("work_hash", previous.work_hash == current.work_hash),
         ("graph_id", previous.graph_id == current.graph_id),
+        (
+            "graph_node_id",
+            previous.graph_node_id == current.graph_node_id,
+        ),
         ("graph_hash", previous.graph_hash == current.graph_hash),
         (
             "provider_node",
@@ -530,6 +814,26 @@ fn validate_hash(name: &str, value: &str) -> Result<(), RuntimeAdapterError> {
     {
         return Err(RuntimeAdapterError::InvalidRecord(format!(
             "{name} must be lowercase canonical sha256"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lower_hex_field(
+    value: &Value,
+    field: &str,
+    expected_len: usize,
+) -> Result<(), RuntimeAdapterError> {
+    let text = value.get(field).and_then(Value::as_str).ok_or_else(|| {
+        RuntimeAdapterError::InvalidRecord(format!("signed lease {field} is required"))
+    })?;
+    if text.len() != expected_len
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(RuntimeAdapterError::InvalidRecord(format!(
+            "signed lease {field} must be {expected_len} lowercase hex characters"
         )));
     }
     Ok(())

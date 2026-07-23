@@ -184,6 +184,33 @@ docs = "gemini"
 }
 
 #[test]
+fn test_loads_cursor_role_override_as_model_provider() {
+    let tmp = TempDir::new().unwrap();
+    let squad_dir = tmp.path().join(".squad");
+    std::fs::create_dir_all(&squad_dir).unwrap();
+    std::fs::write(
+        squad_dir.join("autopilot.toml"),
+        r#"
+[role_overrides]
+coding_worker = "cursor"
+"#,
+    )
+    .unwrap();
+
+    let config = load_config(tmp.path()).unwrap();
+
+    assert_eq!(
+        config.role_overrides.get("coding_worker"),
+        Some(&ModelProvider::Cursor)
+    );
+    assert_eq!(ModelProvider::Cursor.as_str(), "cursor");
+    assert_eq!(
+        "cursor".parse::<ModelProvider>().unwrap(),
+        ModelProvider::Cursor
+    );
+}
+
+#[test]
 fn test_rejects_unknown_role_override_provider() {
     let tmp = TempDir::new().unwrap();
     let squad_dir = tmp.path().join(".squad");

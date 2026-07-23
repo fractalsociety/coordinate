@@ -1,7 +1,9 @@
 pub mod autopilot;
 pub mod fractal_runtime;
+pub mod graph_supervisor;
 pub mod host_bridge;
 pub mod init;
+pub mod node_verifier;
 pub mod roles;
 pub mod service;
 pub mod session;

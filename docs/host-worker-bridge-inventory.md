@@ -55,6 +55,14 @@ tmuxSessionPrefix = "coordinate"
 startupTimeoutSecs = 90
 readinessPollSecs = 2
 intervalSecs = 5
+executionGraphUrl = "http://127.0.0.1:8091"
+
+[nodeVerifier]
+program = "dataevol-node-verifier"
+args = []
+timeoutSecs = 300
+minVerifiers = 1
+requireHiddenRegression = true
 
 [[workers]]
 id = "codex-1"
@@ -69,3 +77,11 @@ readinessTimeoutSecs = 45
 ```
 
 Codex workers default to `codex --yolo`; Claude workers default to `claude --dangerously-skip-permissions`. The bridge attaches to an existing target when present, otherwise it spawns a tmux session unless `createSession = false`.
+
+Compiled graph tasks fail closed unless `nodeVerifier` is configured. The verifier
+receives the node, acceptance criteria, and worker report as JSON on stdin. It must
+run DataEvol public and isolated hidden checks and return JSON containing
+`publicCheck`, `hiddenRegression`, and `verifierVerdicts`, with every evidence item
+carrying a `sha256:<64 hex>` hash. Coordinate independently enforces the configured
+evidence floor, persists the bundle and its aggregate hash, and then completes,
+retries, or escalates the node while updating its execution-board checkout.

@@ -96,6 +96,7 @@ fn test_provider_tier_maps_each_provider() {
         provider_tier(&ModelProvider::Gemini),
         ProviderTier::Frontier
     );
+    assert_eq!(provider_tier(&ModelProvider::Cursor), ProviderTier::Cheap);
 }
 
 #[test]
@@ -116,10 +117,11 @@ fn test_provider_adapter_overview_surfaces_existing_adapter() {
 #[test]
 fn test_all_provider_adapter_overviews_covers_every_provider() {
     let overviews = all_provider_adapter_overviews();
-    assert_eq!(overviews.len(), 7);
+    assert_eq!(overviews.len(), 8);
     let providers: Vec<&str> = overviews.iter().map(|o| o.provider.as_str()).collect();
     assert!(providers.contains(&"claude"));
     assert!(providers.contains(&"codex"));
+    assert!(providers.contains(&"cursor"));
     assert!(providers.contains(&"openrouter_free"));
     assert!(providers.contains(&"local"));
 }
