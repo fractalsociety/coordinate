@@ -703,8 +703,7 @@ fn rejected_graph_node_retries_once_escalates_and_never_double_claims() {
                     .map(|claimed| (worker_id.to_string(), claimed.id))
             })
         })
-        .map(|handle| handle.join().unwrap())
-        .flatten()
+        .filter_map(|handle| handle.join().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].1, task.id);
@@ -1263,8 +1262,7 @@ fn service_pull_queue_concurrent_claims_do_not_duplicate_task() {
 
     let claimed = handles
         .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .flatten()
+        .filter_map(|handle| handle.join().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].1, task.id);

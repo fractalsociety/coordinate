@@ -797,10 +797,7 @@ Test Requirements
     let store = Store::open(&tmp.path().join(".squad").join("messages.db")).unwrap();
     let run = store.get_autopilot_run(1).unwrap().unwrap();
     assert_eq!(run.status, "running");
-    assert_eq!(
-        store.list_autopilot_agents(run.id).unwrap().len() >= 3,
-        true
-    );
+    assert!(store.list_autopilot_agents(run.id).unwrap().len() >= 3);
     assert_eq!(store.list_autopilot_tasks(run.id).unwrap().len(), 3);
     assert!(!store
         .list_autopilot_terminal_sessions(run.id)

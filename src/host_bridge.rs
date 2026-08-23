@@ -660,7 +660,7 @@ fn collect_json_strings<'a>(value: &'a serde_json::Value, output: &mut Vec<&'a s
 fn marker_suffix<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     let normalized = line
         .trim_start()
-        .trim_start_matches(|c| matches!(c, '•' | '⏺' | '↳' | '>' | '›' | '-'))
+        .trim_start_matches(['•', '⏺', '↳', '>', '›', '-'])
         .trim_start();
     normalized.strip_prefix(marker)
 }

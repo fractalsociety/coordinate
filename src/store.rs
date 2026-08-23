@@ -204,6 +204,73 @@ pub struct ServiceQueueReapResult {
     pub failed: Vec<ServiceTaskRecord>,
 }
 
+/// Result of a dependency-aware graph-node lease checkout (INT-078).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNodeLeaseCheckout {
+    pub task: ServiceTaskRecord,
+    pub graph_source: String,
+    pub node_id: String,
+    pub lease_owner: String,
+    pub lease_expires_at: String,
+}
+
+/// Verifier handoff persistence for a reported graph node (INT-078).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNodeVerifierHandoff {
+    pub task: ServiceTaskRecord,
+    pub evidence_hash: String,
+    pub decision: String,
+}
+
+/// One compiled execution graph persisted durably by the live path (INT-084).
+///
+/// The row is keyed by `graph_hash` so replaying the same compiled graph is
+/// idempotent, while a different body under the same hash is rejected.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedExecutionGraph {
+    pub graph_id: String,
+    pub graph_hash: String,
+    pub graph_source: String,
+    pub schema: String,
+    pub work_hash: String,
+    pub harness_hash: String,
+    pub compiler_version: String,
+    pub target: String,
+    pub node_count: i64,
+    pub content_hash: String,
+    pub document: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Durable-persistence input for one compiled execution graph (INT-084).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionGraphInput {
+    pub graph_id: String,
+    pub graph_hash: String,
+    pub graph_source: String,
+    pub schema: String,
+    pub work_hash: String,
+    pub harness_hash: String,
+    pub compiler_version: String,
+    pub target: String,
+    pub node_count: i64,
+    pub content_hash: String,
+    pub document: serde_json::Value,
+}
+
+/// Outcome of persisting a compiled execution graph (INT-084).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedExecutionGraphOutcome {
+    pub graph: PersistedExecutionGraph,
+    /// False when an identical graph was already persisted (idempotent replay).
+    pub created: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceQueueLaneStat {
@@ -613,6 +680,21 @@ impl Store {
                  id TEXT PRIMARY KEY,
                  path TEXT NOT NULL UNIQUE,
                  title TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS service_execution_graphs (
+                 graph_hash TEXT PRIMARY KEY,
+                 graph_id TEXT NOT NULL,
+                 graph_source TEXT NOT NULL UNIQUE,
+                 schema TEXT NOT NULL,
+                 work_hash TEXT NOT NULL,
+                 harness_hash TEXT NOT NULL,
+                 compiler_version TEXT NOT NULL,
+                 target TEXT NOT NULL,
+                 node_count INTEGER NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 document TEXT NOT NULL,
                  created_at TEXT NOT NULL,
                  updated_at TEXT NOT NULL
              );
@@ -2446,14 +2528,10 @@ impl Store {
                     .then_with(|| a.id.cmp(&b.id))
             });
 
-            let Some(task) = candidates
-                .into_iter()
-                .filter(|task| {
-                    service_worker_can_claim_task(&worker, task, lane_escape_secs)
-                        && self.ensure_service_task_eligible(task).is_ok()
-                })
-                .next()
-            else {
+            let Some(task) = candidates.into_iter().find(|task| {
+                service_worker_can_claim_task(&worker, task, lane_escape_secs)
+                    && self.ensure_service_task_eligible(task).is_ok()
+            }) else {
                 return Ok(None);
             };
 
@@ -2617,6 +2695,415 @@ impl Store {
             Some(worker_id),
             Some(task_id),
             &serde_json::json!({"reason": reason}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    /// Durably persist one compiled execution graph.
+    ///
+    /// Replaying the identical graph is idempotent; a different body under the
+    /// same `graph_hash` is a conflict and is rejected.
+    pub fn service_persist_execution_graph(
+        &self,
+        input: ExecutionGraphInput,
+    ) -> Result<PersistedExecutionGraphOutcome> {
+        for (field, value) in [
+            ("graph_id", input.graph_id.as_str()),
+            ("graph_hash", input.graph_hash.as_str()),
+            ("graph_source", input.graph_source.as_str()),
+            ("content_hash", input.content_hash.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                anyhow::bail!("execution graph {field} cannot be empty");
+            }
+        }
+        if let Some(existing) = self.service_get_execution_graph(&input.graph_hash)? {
+            if existing.content_hash != input.content_hash {
+                anyhow::bail!(
+                    "execution graph {} conflicts with persisted content {}",
+                    input.graph_hash,
+                    existing.content_hash
+                );
+            }
+            return Ok(PersistedExecutionGraphOutcome {
+                graph: existing,
+                created: false,
+            });
+        }
+
+        let now = service_now();
+        self.conn.execute(
+            "INSERT INTO service_execution_graphs (
+                graph_hash, graph_id, graph_source, schema, work_hash, harness_hash,
+                compiler_version, target, node_count, content_hash, document,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            params![
+                input.graph_hash,
+                input.graph_id,
+                input.graph_source,
+                input.schema,
+                input.work_hash,
+                input.harness_hash,
+                input.compiler_version,
+                input.target,
+                input.node_count,
+                input.content_hash,
+                serde_json::to_string(&input.document)?,
+                now
+            ],
+        )?;
+        self.service_record_event(
+            "graph.persisted",
+            None,
+            None,
+            &serde_json::json!({
+                "graph_id": input.graph_id,
+                "graph_hash": input.graph_hash,
+                "content_hash": input.content_hash,
+            }),
+        )?;
+        let graph = self
+            .service_get_execution_graph(&input.graph_hash)?
+            .context("persisted execution graph disappeared")?;
+        Ok(PersistedExecutionGraphOutcome {
+            graph,
+            created: true,
+        })
+    }
+
+    /// Load one durably persisted compiled execution graph by hash.
+    pub fn service_get_execution_graph(
+        &self,
+        graph_hash: &str,
+    ) -> Result<Option<PersistedExecutionGraph>> {
+        let mut statement = self.conn.prepare(
+            "SELECT graph_id, graph_hash, graph_source, schema, work_hash, harness_hash,
+                    compiler_version, target, node_count, content_hash, document,
+                    created_at, updated_at
+             FROM service_execution_graphs WHERE graph_hash = ?1",
+        )?;
+        let mut rows = statement.query(params![graph_hash])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(execution_graph_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List every durably persisted compiled execution graph, newest first.
+    pub fn service_list_execution_graphs(&self) -> Result<Vec<PersistedExecutionGraph>> {
+        let mut statement = self.conn.prepare(
+            "SELECT graph_id, graph_hash, graph_source, schema, work_hash, harness_hash,
+                    compiler_version, target, node_count, content_hash, document,
+                    created_at, updated_at
+             FROM service_execution_graphs ORDER BY created_at DESC, graph_hash ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut graphs = Vec::new();
+        while let Some(row) = rows.next()? {
+            graphs.push(execution_graph_from_row(row)?);
+        }
+        Ok(graphs)
+    }
+
+    /// Dependency-aware exclusive checkout of one compiled graph-node task.
+    ///
+    /// Enforces the INT-078 lease boundary at the store layer:
+    /// - task must belong to a `fractal-graph:` source
+    /// - incomplete dependencies fail closed (no lease granted)
+    /// - at most one active lease owner per node (same worker may refresh)
+    pub fn service_checkout_graph_node_lease(
+        &self,
+        worker_id: &str,
+        task_id: &str,
+        lease_secs: i64,
+    ) -> Result<GraphNodeLeaseCheckout> {
+        if lease_secs < 1 {
+            anyhow::bail!("lease_secs must be positive");
+        }
+        let worker = self
+            .service_get_worker(worker_id)?
+            .with_context(|| format!("service worker does not exist: {worker_id}"))?;
+        if !matches!(
+            worker.status.as_str(),
+            WORKER_STATE_READY | WORKER_STATE_ASSIGNED | WORKER_STATE_WORKING
+        ) {
+            anyhow::bail!("service worker {worker_id} is not ready to checkout graph leases");
+        }
+
+        let task = self.require_service_task(task_id)?;
+        if !task.source_prd_path.starts_with("fractal-graph:") {
+            anyhow::bail!("service task {task_id} is not a compiled graph node");
+        }
+        let node_id = task
+            .source_task_number
+            .clone()
+            .context("compiled graph task is missing its node id")?;
+        self.ensure_service_task_eligible(&task)?;
+
+        if let Some(owner) = task.lease_owner.as_deref() {
+            if matches!(
+                task.state.as_str(),
+                TASK_STATE_ACKED | TASK_STATE_WORKING | TASK_STATE_REPORTED | TASK_STATE_VERIFIED
+            ) {
+                if owner != worker_id {
+                    anyhow::bail!(
+                        "graph node {node_id} already holds an active lease owned by {owner}"
+                    );
+                }
+                let expires = task
+                    .lease_expires_at
+                    .clone()
+                    .context("active graph lease is missing expiry")?;
+                return Ok(GraphNodeLeaseCheckout {
+                    graph_source: task.source_prd_path.clone(),
+                    node_id,
+                    lease_owner: owner.to_string(),
+                    lease_expires_at: expires,
+                    task,
+                });
+            }
+        }
+
+        // At-most-once: refuse checkout when another in-flight lease exists for
+        // the same graph node identity (source + node id).
+        for candidate in self.service_prd_tasks(&task.source_prd_path)? {
+            if candidate.id == task.id {
+                continue;
+            }
+            if candidate.source_task_number.as_deref() != Some(node_id.as_str()) {
+                continue;
+            }
+            if candidate.lease_owner.is_some()
+                && matches!(
+                    candidate.state.as_str(),
+                    TASK_STATE_ACKED
+                        | TASK_STATE_WORKING
+                        | TASK_STATE_REPORTED
+                        | TASK_STATE_VERIFIED
+                )
+            {
+                anyhow::bail!(
+                    "graph node {node_id} already holds an active lease owned by {}",
+                    candidate.lease_owner.as_deref().unwrap_or("unknown")
+                );
+            }
+        }
+
+        if !matches!(task.state.as_str(), TASK_STATE_QUEUED | TASK_STATE_ASSIGNED) {
+            anyhow::bail!(
+                "graph node {node_id} cannot be checked out from state {}",
+                task.state
+            );
+        }
+        if let Some(assigned) = task.assigned_worker_id.as_deref() {
+            if assigned != worker_id {
+                anyhow::bail!("graph node {node_id} is assigned to {assigned}, not {worker_id}");
+            }
+        }
+
+        let now = service_now();
+        let lease_expires_at = service_time_after_secs(lease_secs);
+        let update_result = if task.state == TASK_STATE_ASSIGNED {
+            self.conn.execute(
+                "UPDATE service_tasks
+                 SET state = ?1,
+                     lease_owner = ?2,
+                     lease_expires_at = ?3,
+                     claimed_at = COALESCE(claimed_at, ?4),
+                     acked_at = COALESCE(acked_at, ?4),
+                     updated_at = ?4
+                 WHERE id = ?5 AND state = ?6 AND assigned_worker_id = ?2
+                   AND (lease_owner IS NULL OR lease_owner = ?2)",
+                params![
+                    TASK_STATE_ACKED,
+                    worker.id,
+                    lease_expires_at,
+                    now,
+                    task.id,
+                    TASK_STATE_ASSIGNED
+                ],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE service_tasks
+                 SET state = ?1,
+                     assigned_worker_id = ?2,
+                     lease_owner = ?2,
+                     lease_expires_at = ?3,
+                     claimed_at = ?4,
+                     acked_at = ?4,
+                     updated_at = ?4
+                 WHERE id = ?5 AND state = ?6 AND assigned_worker_id IS NULL
+                   AND lease_owner IS NULL",
+                params![
+                    TASK_STATE_ACKED,
+                    worker.id,
+                    lease_expires_at,
+                    now,
+                    task.id,
+                    TASK_STATE_QUEUED
+                ],
+            )?
+        };
+        if update_result != 1 {
+            anyhow::bail!(
+                "graph node {node_id} lost the at-most-once lease race for worker {worker_id}"
+            );
+        }
+        self.conn.execute(
+            "UPDATE service_workers
+             SET status = ?1, current_task_id = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![WORKER_STATE_WORKING, task.id, now, worker.id],
+        )?;
+        self.service_record_event(
+            "task.graph_lease_checked_out",
+            Some(&worker.id),
+            Some(&task.id),
+            &serde_json::json!({
+                "node_id": node_id,
+                "lease_expires_at": lease_expires_at,
+                "graph_source": task.source_prd_path,
+            }),
+        )?;
+        let leased = self.require_service_task(&task.id)?;
+        Ok(GraphNodeLeaseCheckout {
+            graph_source: leased.source_prd_path.clone(),
+            node_id,
+            lease_owner: worker.id.clone(),
+            lease_expires_at,
+            task: leased,
+        })
+    }
+
+    /// List active (acked/working/reported/verified) leases for one compiled graph.
+    pub fn service_active_graph_node_leases(
+        &self,
+        graph_source: &str,
+    ) -> Result<Vec<ServiceTaskRecord>> {
+        Ok(self
+            .service_prd_tasks(graph_source)?
+            .into_iter()
+            .filter(|task| {
+                task.lease_owner.is_some()
+                    && matches!(
+                        task.state.as_str(),
+                        TASK_STATE_ACKED
+                            | TASK_STATE_WORKING
+                            | TASK_STATE_REPORTED
+                            | TASK_STATE_VERIFIED
+                    )
+            })
+            .collect())
+    }
+
+    /// Persist an independent verifier handoff for a reported graph node.
+    pub fn service_handoff_graph_node_verification(
+        &self,
+        task_id: &str,
+        summary: &str,
+        evidence_hash: &str,
+        evidence: serde_json::Value,
+    ) -> Result<GraphNodeVerifierHandoff> {
+        let task = self.require_service_task(task_id)?;
+        if !task.source_prd_path.starts_with("fractal-graph:") {
+            anyhow::bail!("service task {task_id} is not a compiled graph node");
+        }
+        if task.lease_owner.is_none() {
+            anyhow::bail!("graph task {task_id} has no active lease for verifier handoff");
+        }
+        let verified = self.service_verify_task(
+            task_id,
+            ServiceTaskProgressInput {
+                summary: summary.to_string(),
+                decision: Some("complete".to_string()),
+                evidence_hash: Some(evidence_hash.to_string()),
+                evidence: Some(evidence),
+            },
+        )?;
+        Ok(GraphNodeVerifierHandoff {
+            task: verified,
+            evidence_hash: evidence_hash.to_string(),
+            decision: "complete".to_string(),
+        })
+    }
+
+    /// Recover expired graph-node leases through the durable queue reaper.
+    pub fn service_recover_expired_graph_leases(
+        &self,
+        steal_after_secs: i64,
+    ) -> Result<ServiceQueueReapResult> {
+        let reaped = self.service_reap_queue(steal_after_secs)?;
+        let is_graph =
+            |task: &ServiceTaskRecord| task.source_prd_path.starts_with("fractal-graph:");
+        Ok(ServiceQueueReapResult {
+            lease_expired: reaped.lease_expired.into_iter().filter(is_graph).collect(),
+            assignment_released: reaped
+                .assignment_released
+                .into_iter()
+                .filter(is_graph)
+                .collect(),
+            failed: reaped.failed.into_iter().filter(is_graph).collect(),
+        })
+    }
+
+    /// Cap retries for one compiled graph node (INT-078 bounded-retry contract).
+    pub fn service_set_graph_node_max_attempts(
+        &self,
+        task_id: &str,
+        max_attempts: i64,
+    ) -> Result<ServiceTaskRecord> {
+        if max_attempts < 1 {
+            anyhow::bail!("max_attempts must be positive");
+        }
+        let task = self.require_service_task(task_id)?;
+        if !task.source_prd_path.starts_with("fractal-graph:") {
+            anyhow::bail!("service task {task_id} is not a compiled graph node");
+        }
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks SET max_attempts = ?1, updated_at = ?2 WHERE id = ?3",
+            params![max_attempts, now, task_id],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.service_record_event(
+            "task.graph_max_attempts_set",
+            task.assigned_worker_id.as_deref(),
+            Some(task_id),
+            &serde_json::json!({"max_attempts": max_attempts}),
+        )?;
+        self.require_service_task(task_id)
+    }
+
+    /// Mark an active graph-node lease as already expired so the reaper can
+    /// exercise expiry recovery without waiting on wall clock.
+    pub fn service_mark_graph_node_lease_expired(
+        &self,
+        task_id: &str,
+    ) -> Result<ServiceTaskRecord> {
+        let task = self.require_service_task(task_id)?;
+        if !task.source_prd_path.starts_with("fractal-graph:") {
+            anyhow::bail!("service task {task_id} is not a compiled graph node");
+        }
+        if task.lease_owner.is_none() {
+            anyhow::bail!("graph task {task_id} has no active lease to expire");
+        }
+        let expired_at = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(5))
+            .context("failed to compute expired lease timestamp")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let now = service_now();
+        let updated = self.conn.execute(
+            "UPDATE service_tasks SET lease_expires_at = ?1, updated_at = ?2 WHERE id = ?3",
+            params![expired_at, now, task_id],
+        )?;
+        ensure_service_updated(updated, "task", task_id)?;
+        self.service_record_event(
+            "task.graph_lease_marked_expired",
+            task.lease_owner.as_deref(),
+            Some(task_id),
+            &serde_json::json!({"lease_expires_at": expired_at}),
         )?;
         self.require_service_task(task_id)
     }
@@ -2864,8 +3351,7 @@ impl Store {
             None => self
                 .service_list_workers()?
                 .into_iter()
-                .filter(|worker| service_worker_can_take_task(worker, &task))
-                .next()
+                .find(|worker| service_worker_can_take_task(worker, &task))
                 .with_context(|| format!("no ready service worker for task {task_id}"))?,
         };
         if !service_worker_can_take_task(&worker, &task) {
@@ -3006,18 +3492,7 @@ impl Store {
                 task.state
             );
         }
-        let report = ServiceTaskReportInput {
-            summary: redact_report_text(&required_service_field("report summary", &input.summary)?),
-            files_inspected: redact_report_list(input.files_inspected),
-            changed_files: redact_report_list(input.changed_files),
-            tests_run: redact_report_list(input.tests_run),
-            verification: redact_report_text(&required_service_field(
-                "report verification",
-                &input.verification,
-            )?),
-            risks: redact_report_text(&input.risks),
-            raw_report: redact_report_text(&input.raw_report),
-        };
+        let report = normalize_service_report(input)?;
         let report_hash = service_report_hash(&report)?;
         let now = service_now();
         self.conn.execute(
@@ -3916,6 +4391,26 @@ fn map_service_event_row(row: &rusqlite::Row) -> rusqlite::Result<ServiceEventRe
     })
 }
 
+fn execution_graph_from_row(row: &rusqlite::Row<'_>) -> Result<PersistedExecutionGraph> {
+    let document: String = row.get(10)?;
+    Ok(PersistedExecutionGraph {
+        graph_id: row.get(0)?,
+        graph_hash: row.get(1)?,
+        graph_source: row.get(2)?,
+        schema: row.get(3)?,
+        work_hash: row.get(4)?,
+        harness_hash: row.get(5)?,
+        compiler_version: row.get(6)?,
+        target: row.get(7)?,
+        node_count: row.get(8)?,
+        content_hash: row.get(9)?,
+        document: serde_json::from_str(&document)
+            .context("persisted execution graph document is not valid JSON")?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
 fn service_now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -4175,6 +4670,25 @@ fn redact_report_text(value: &str) -> String {
     redacted
 }
 
+fn normalize_service_report(input: ServiceTaskReportInput) -> Result<ServiceTaskReportInput> {
+    Ok(ServiceTaskReportInput {
+        summary: redact_report_text(&required_service_field("report summary", &input.summary)?),
+        files_inspected: redact_report_list(input.files_inspected),
+        changed_files: redact_report_list(input.changed_files),
+        tests_run: redact_report_list(input.tests_run),
+        verification: redact_report_text(&required_service_field(
+            "report verification",
+            &input.verification,
+        )?),
+        risks: redact_report_text(&input.risks),
+        raw_report: redact_report_text(&input.raw_report),
+    })
+}
+
+pub(crate) fn service_report_input_hash(input: &ServiceTaskReportInput) -> Result<String> {
+    service_report_hash(&normalize_service_report(input.clone())?)
+}
+
 fn service_report_hash(report: &ServiceTaskReportInput) -> Result<String> {
     let canonical = serde_json::to_vec(report)?;
     let digest = Sha256::digest(canonical);
@@ -4378,7 +4892,7 @@ fn normalized_review_verdict(verdict: &str) -> Result<&'static str> {
     match verdict.trim().to_ascii_lowercase().as_str() {
         "accepted" | "accept" | "approved" | "approve" => Ok("accepted"),
         "rejected" | "reject" | "failed" | "fail" => Ok("rejected"),
-        value if value.is_empty() => anyhow::bail!("autopilot review verdict cannot be empty"),
+        "" => anyhow::bail!("autopilot review verdict cannot be empty"),
         value => anyhow::bail!(
             "invalid autopilot review verdict '{value}'. Expected accepted or rejected"
         ),

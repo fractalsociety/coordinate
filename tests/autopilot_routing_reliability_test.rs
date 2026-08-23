@@ -452,7 +452,7 @@ fn test_curate_memory_deduplicates_and_caps() {
 #[test]
 fn test_curate_memory_tags_and_skips_empty() {
     let curated = curate_memory(
-        &vec![
+        &[
             "   ".to_string(),
             "verification failed and a test regressed".to_string(),
         ],

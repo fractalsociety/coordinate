@@ -74,7 +74,7 @@ impl FromStr for ModelProvider {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct AutopilotConfig {
     #[serde(default)]
     pub model_mix: ModelMix,
@@ -82,16 +82,6 @@ pub struct AutopilotConfig {
     pub role_overrides: BTreeMap<String, ModelProvider>,
     #[serde(default)]
     pub adaptive_scheduling: AdaptiveSchedulingConfig,
-}
-
-impl Default for AutopilotConfig {
-    fn default() -> Self {
-        Self {
-            model_mix: ModelMix::default(),
-            role_overrides: BTreeMap::new(),
-            adaptive_scheduling: AdaptiveSchedulingConfig::default(),
-        }
-    }
 }
 
 impl AutopilotConfig {
@@ -1707,6 +1697,7 @@ fn assign_model_mix(model_mix: &ModelMix, count: usize) -> Vec<ModelProvider> {
     assigned
 }
 
+#[allow(clippy::too_many_arguments)]
 fn role_prompt_spec(
     role_id: &str,
     role_name: &str,
@@ -3750,7 +3741,7 @@ pub fn next_retry_delay_seconds(attempt: u32, base_seconds: u64, cap_seconds: u6
     if attempt == 0 {
         return 0;
     }
-    let shift = (attempt - 1).min(20) as u32;
+    let shift = (attempt - 1).min(20);
     let raw = base_seconds.saturating_mul(1u64 << shift);
     raw.min(cap_seconds)
 }
@@ -5165,4 +5156,98 @@ pub fn verify_statistics_plan(
             && findings[0] == "statistics plan has metric, threshold, and sample size",
         findings,
     }
+}
+
+/// Schema marker for the Coordinate graph-supervisor lease-boundary contract (INT-078).
+pub const GRAPH_SUPERVISOR_LEASE_CONTRACT_SCHEMA: &str =
+    "coordinate.graph_supervisor_lease_boundary.v1";
+
+/// Frozen graph id used by the INT-078 lease-boundary fixture.
+pub const GRAPH_SUPERVISOR_LEASE_FIXTURE_GRAPH_ID: &str = "graph:int078-lease-boundary";
+
+/// Bounded retry budget exercised by the INT-078 lease-boundary fixture.
+pub const GRAPH_SUPERVISOR_LEASE_FIXTURE_MAX_ATTEMPTS: i64 = 2;
+
+fn int078_hash(byte: char) -> String {
+    // Must be lowercase hex so graph validation accepts the frozen hashes.
+    let nibble = match byte {
+        'w' => 'a',
+        'h' => 'b',
+        'g' => 'c',
+        other => other,
+    };
+    format!("sha256:{}", nibble.to_string().repeat(64))
+}
+
+/// Compile the frozen INT-078 execution-graph fixture used to prove the
+/// graph-supervisor lease boundary (dependency-aware checkout, at-most-once
+/// active lease, bounded retry, verifier handoff, and expiry recovery).
+///
+/// This is the Autopilot-owned compile surface for the contract; it does not
+/// enqueue work or touch HTTP.
+pub fn frozen_graph_supervisor_lease_fixture(
+) -> crate::graph_supervisor::CompiledExecutionGraph {
+    use crate::graph_supervisor::{
+        CompiledExecutionGraph, CompiledGraphEdge, CompiledGraphNode, EXECUTION_GRAPH_SCHEMA_V1,
+    };
+
+    let node = |id: &str, capability: &str, instruction: &str| CompiledGraphNode {
+        id: id.to_string(),
+        kind: "codex".to_string(),
+        capability: capability.to_string(),
+        memory_scopes: vec!["project:int078-lease-boundary".to_string()],
+        route_candidates: vec!["codex://coordinate-worker".to_string()],
+        sandbox_profile: Some("workspace-write".to_string()),
+        requires: Vec::new(),
+        instruction: Some(instruction.to_string()),
+        budget: serde_json::json!({
+            "timeout_ms": 60_000,
+            "max_attempts": GRAPH_SUPERVISOR_LEASE_FIXTURE_MAX_ATTEMPTS,
+        }),
+    };
+
+    CompiledExecutionGraph {
+        schema: EXECUTION_GRAPH_SCHEMA_V1.to_string(),
+        graph_id: GRAPH_SUPERVISOR_LEASE_FIXTURE_GRAPH_ID.to_string(),
+        work_hash: int078_hash('w'),
+        harness_hash: int078_hash('h'),
+        compiler_version: "fractal-harnessc:int078-lease-boundary".to_string(),
+        target: "darwin".to_string(),
+        nodes: vec![
+            node(
+                "compile",
+                "graph.compile",
+                "Compile the INT-078 lease-boundary root node.",
+            ),
+            node(
+                "execute",
+                "graph.execute",
+                "Execute the INT-078 lease-boundary middle node under an exclusive lease.",
+            ),
+            node(
+                "verify",
+                "graph.verify",
+                "Verify the INT-078 lease-boundary terminal node after handoff.",
+            ),
+        ],
+        edges: vec![
+            CompiledGraphEdge {
+                from: "compile".to_string(),
+                to: "execute".to_string(),
+                condition: "success".to_string(),
+            },
+            CompiledGraphEdge {
+                from: "execute".to_string(),
+                to: "verify".to_string(),
+                condition: "success".to_string(),
+            },
+        ],
+        graph_hash: int078_hash('g'),
+    }
+}
+
+/// Stable Coordinate queue source key for the frozen INT-078 lease fixture.
+pub fn frozen_graph_supervisor_lease_source() -> String {
+    let graph = frozen_graph_supervisor_lease_fixture();
+    format!("fractal-graph:{}:{}", graph.graph_id, graph.graph_hash)
 }

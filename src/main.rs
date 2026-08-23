@@ -498,6 +498,7 @@ fn cmd_graph_supervisor(args: Vec<String>) -> Result<()> {
     let mut graph_path = None;
     let mut database_path = None;
     let mut watch = false;
+    let mut projection = false;
     let mut interval_ms = 1_000_u64;
     let mut index = 0;
     while index < args.len() {
@@ -523,6 +524,10 @@ fn cmd_graph_supervisor(args: Vec<String>) -> Result<()> {
                 watch = true;
                 index += 1;
             }
+            "--projection" => {
+                projection = true;
+                index += 1;
+            }
             flag => bail!("unknown graph-supervisor flag: {flag}"),
         }
     }
@@ -534,13 +539,17 @@ fn cmd_graph_supervisor(args: Vec<String>) -> Result<()> {
     )
     .with_context(|| format!("invalid execution graph {}", graph_path.display()))?;
     graph.validate()?;
-    let node_count = graph.nodes.len();
     let store = squad::store::Store::open(&database_path)?;
     loop {
-        let result = squad::graph_supervisor::reconcile_ready_graph_nodes(&store, &graph)?;
-        println!("{}", serde_json::to_string(&result)?);
-        let finished = result.complete_node_ids.len() == node_count;
-        if !watch || finished {
+        // The live path validates, durably persists, and reconciles in one
+        // step, so restarting the supervisor resumes the same graph.
+        let live = squad::graph_supervisor::compile_and_persist_graph(&store, &graph)?;
+        if projection {
+            println!("{}", serde_json::to_string(&live)?);
+        } else {
+            println!("{}", serde_json::to_string(&live.reconcile)?);
+        }
+        if !watch || live.projection.terminal {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(interval_ms));
@@ -1117,6 +1126,7 @@ fn execute_macos_terminal_spawn_with_sequential_delivery(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_terminal_spawn_with_sequential_delivery<F>(
     store: &squad::store::Store,
     run_id: i64,
@@ -2545,10 +2555,13 @@ COMMANDS
                                              List tasks with optional filters
   squad serve [--bind <addr:port>]           Run Coordinate HTTP service mode (default 127.0.0.1:8787)
                                              HTTP pull queue: POST /tasks/next, POST /tasks/:id/touch, GET /tasks/stats
+                                             HTTP graph path: POST /graphs/compile, POST /graphs/:hash/nodes/:node/{lease,report,verify},
+                                             POST /graphs/:hash/leases/recover, GET /graphs/:hash/projection
   squad fractal-runtime run --input <submission.json> --db <coordinate.sqlite3> (--fractald-socket <path> | --fractald-url <origin>)
                                              Admit a signed graph to fractald and durably poll state + evidence
-  squad graph-supervisor --graph <graph.json> --db <coordinate.sqlite3> [--watch] [--interval-ms <n>]
-                                             Enqueue dependency-ready compiled graph nodes into the pull queue
+  squad graph-supervisor --graph <graph.json> --db <coordinate.sqlite3> [--watch] [--projection] [--interval-ms <n>]
+                                             Compile, durably persist, and enqueue dependency-ready graph nodes;
+                                             --projection also prints the terminal graph projection
   squad host-bridge --worker-id <id> --tmux-target <target>
                                              Bridge a host tmux pane to Coordinate HTTP pull-queue tasks and reports
   squad host-bridge --config <host-bridge.toml>  Run configured host-side Codex/Claude worker bridge

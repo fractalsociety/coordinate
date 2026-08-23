@@ -127,6 +127,95 @@ pub struct FractalRuntimeJob {
     pub updated_at_ms: u64,
 }
 
+/// Schema marker binding a Coordinate graph-node lease to runtime verification
+/// handoff state (INT-078 lease boundary).
+pub const GRAPH_SUPERVISOR_LEASE_BINDING_SCHEMA: &str =
+    "coordinate.graph_supervisor_lease_binding.v1";
+
+/// Durable correlation between a Coordinate pull-queue lease and the verifier
+/// handoff that may only proceed while the lease owner remains exclusive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSupervisorLeaseBinding {
+    pub schema: String,
+    pub coordinate_task_id: String,
+    pub graph_id: String,
+    pub graph_node_id: String,
+    pub graph_hash: String,
+    pub lease_owner: String,
+    pub lease_expires_at: String,
+    pub verification_state: VerificationState,
+    pub evidence_root: Option<String>,
+}
+
+impl GraphSupervisorLeaseBinding {
+    /// Build a pending binding from an exclusive Coordinate lease.
+    pub fn from_active_lease(
+        coordinate_task_id: impl Into<String>,
+        graph_id: impl Into<String>,
+        graph_node_id: impl Into<String>,
+        graph_hash: impl Into<String>,
+        lease_owner: impl Into<String>,
+        lease_expires_at: impl Into<String>,
+    ) -> Result<Self, RuntimeAdapterError> {
+        let graph_hash = graph_hash.into();
+        validate_hash("graph_hash", &graph_hash)?;
+        let lease_owner = lease_owner.into();
+        let lease_expires_at = lease_expires_at.into();
+        let coordinate_task_id = coordinate_task_id.into();
+        let graph_id = graph_id.into();
+        let graph_node_id = graph_node_id.into();
+        for (name, value) in [
+            ("coordinate_task_id", coordinate_task_id.as_str()),
+            ("graph_id", graph_id.as_str()),
+            ("graph_node_id", graph_node_id.as_str()),
+            ("lease_owner", lease_owner.as_str()),
+            ("lease_expires_at", lease_expires_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(RuntimeAdapterError::InvalidRecord(format!(
+                    "{name} cannot be empty"
+                )));
+            }
+        }
+        Ok(Self {
+            schema: GRAPH_SUPERVISOR_LEASE_BINDING_SCHEMA.to_string(),
+            coordinate_task_id,
+            graph_id,
+            graph_node_id,
+            graph_hash,
+            lease_owner,
+            lease_expires_at,
+            verification_state: VerificationState::Pending,
+            evidence_root: None,
+        })
+    }
+
+    /// Apply an independent verifier handoff. Rejects empty evidence and
+    /// preserves fail-closed pending state on rejection.
+    pub fn apply_verifier_handoff(
+        &mut self,
+        accepted: bool,
+        evidence_root: impl Into<String>,
+    ) -> Result<(), RuntimeAdapterError> {
+        let evidence_root = evidence_root.into();
+        validate_hash("evidence_root", &evidence_root)?;
+        if accepted {
+            self.verification_state = VerificationState::Verified;
+            self.evidence_root = Some(evidence_root);
+        } else {
+            self.verification_state = VerificationState::Rejected;
+            self.evidence_root = Some(evidence_root);
+        }
+        Ok(())
+    }
+
+    /// True when verifier handoff completed successfully.
+    pub fn handoff_verified(&self) -> bool {
+        self.verification_state == VerificationState::Verified && self.evidence_root.is_some()
+    }
+}
+
 /// Newline-delimited JSON request envelope understood by `fractald`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FractaldRequest {
